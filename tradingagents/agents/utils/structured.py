@@ -28,12 +28,33 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 
+def _has_structured_summary_block(text: str) -> bool:
+    return "STRUCTURED_SUMMARY" in text and "END_STRUCTURED_SUMMARY" in text
+
+
+def _log_summary_status(agent_name: str, block: str, parse: str) -> None:
+    logger.warning(
+        "[structured-summary] agent=%s block=%s parse=%s",
+        agent_name,
+        block,
+        parse,
+    )
+
+
 def bind_structured(llm: Any, schema: type[T], agent_name: str) -> Optional[Any]:
     """Return ``llm.with_structured_output(schema)`` or ``None`` if unsupported.
 
     Logs a warning when the binding fails so the user understands the agent
     will use free-text generation for every call instead of one-shot fallback.
     """
+    # Temporarily disable provider-native structured output binding.
+    # We currently rely on natural-language responses plus a trailing
+    # STRUCTURED_SUMMARY block, which is parsed locally into schema objects.
+    # This avoids repeated provider 400s on models that reject tool_choice
+    # or structured output in thinking mode.
+    return None
+
+    # Keep the original implementation below for easy re-enable later.
     try:
         return llm.with_structured_output(schema)
     except (NotImplementedError, AttributeError) as exc:
@@ -71,3 +92,48 @@ def invoke_structured_or_freetext(
 
     response = plain_llm.invoke(prompt)
     return response.content
+
+
+def invoke_structured_or_freetext_result(
+    structured_llm: Optional[Any],
+    plain_llm: Any,
+    prompt: Any,
+    render: Callable[[T], str],
+    agent_name: str,
+    fallback: Optional[Callable[[str], T]] = None,
+) -> tuple[str, Optional[T]]:
+    """Run the structured call and return both rendered text and parsed result."""
+    if structured_llm is not None:
+        try:
+            result = structured_llm.invoke(prompt)
+            return render(result), result
+        except Exception as exc:
+            logger.warning(
+                "%s: structured-output invocation failed (%s); retrying once as free text",
+                agent_name, exc,
+            )
+
+    response = plain_llm.invoke(prompt)
+    response_text = response.content
+    has_summary = _has_structured_summary_block(response_text)
+    block_status = "yes" if has_summary else "no"
+    parsed = None
+    if fallback is not None:
+        try:
+            parsed = fallback(response_text)
+            _log_summary_status(
+                agent_name,
+                block_status,
+                "success" if parsed is not None else "none",
+            )
+        except Exception as exc:
+            logger.warning(
+                "[structured-summary] agent=%s block=%s parse=failed error=%s",
+                agent_name,
+                block_status,
+                exc,
+            )
+            parsed = None
+    else:
+        _log_summary_status(agent_name, block_status, "skipped")
+    return response_text, parsed

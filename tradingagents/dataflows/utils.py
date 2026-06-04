@@ -7,12 +7,10 @@ from typing import Annotated
 
 SavePathType = Annotated[str, "File path to save data. If None, data is not saved."]
 
-# Tickers can contain letters, digits, dot, dash, underscore, caret
-# (index symbols like ^GSPC), equals (futures like GC=F), and plus
-# (forex/CFD symbols like XAUUSD+). None of these enable directory
-# traversal, so the value never escapes a containing directory when
-# interpolated into a path. Anything else is rejected.
-_TICKER_PATH_RE = re.compile(r"^[A-Za-z0-9._\-\^=+]+$")
+# Tickers can contain letters, digits, dot, dash, underscore, and caret
+# (for index symbols like ^GSPC). Anything else is rejected so the value
+# never escapes a containing directory when interpolated into a path.
+_TICKER_PATH_RE = re.compile(r"^[A-Za-z0-9._\-\^]+$")
 
 
 def safe_ticker_component(value: str, *, max_len: int = 32) -> str:
@@ -74,3 +72,27 @@ def get_next_weekday(date):
         return next_weekday
     else:
         return date
+
+
+def get_prev_cn_trading_day(value: str) -> str:
+    """Return the latest China trading day on or before the given date."""
+    current = datetime.strptime(value, "%Y-%m-%d").date()
+    try:
+        import akshare as ak
+        cal = ak.tool_trade_date_hist_sina()
+    except Exception:
+        while current.weekday() >= 5:
+            current -= timedelta(days=1)
+        return current.strftime("%Y-%m-%d")
+
+    if cal is None or cal.empty:
+        while current.weekday() >= 5:
+            current -= timedelta(days=1)
+        return current.strftime("%Y-%m-%d")
+
+    col = next((c for c in cal.columns if "trade_date" in c.lower() or "日期" in c), cal.columns[0])
+    dates = pd.to_datetime(cal[col], errors="coerce").dropna().dt.date.tolist()
+    valid = [d for d in dates if d <= current]
+    if not valid:
+        return current.strftime("%Y-%m-%d")
+    return max(valid).strftime("%Y-%m-%d")

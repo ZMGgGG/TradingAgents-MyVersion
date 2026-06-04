@@ -15,6 +15,11 @@ class InvestDebateState(TypedDict):
     current_response: Annotated[str, "Latest response"]  # Last response
     judge_decision: Annotated[str, "Final judge decision"]  # Last response
     count: Annotated[int, "Length of the current conversation"]  # Conversation length
+    bull_signal: Annotated[dict, "Structured bull signal"]
+    bear_signal: Annotated[dict, "Structured bear signal"]
+    signal_summary: Annotated[str, "Aggregated investment debate summary"]
+    signal_score: Annotated[float, "Aggregated investment score"]
+    signal_confidence: Annotated[float, "Aggregated investment confidence"]
 
 
 # Risk management team state
@@ -41,23 +46,32 @@ class RiskDebateState(TypedDict):
     ]  # Last response
     judge_decision: Annotated[str, "Judge's decision"]
     count: Annotated[int, "Length of the current conversation"]  # Conversation length
+    aggressive_signal: Annotated[dict, "Structured aggressive risk signal"]
+    conservative_signal: Annotated[dict, "Structured conservative risk signal"]
+    neutral_signal: Annotated[dict, "Structured neutral risk signal"]
+    signal_summary: Annotated[str, "Aggregated risk debate summary"]
+    signal_score: Annotated[float, "Aggregated risk score"]
+    signal_confidence: Annotated[float, "Aggregated risk confidence"]
 
 
 class AgentState(MessagesState):
     company_of_interest: Annotated[str, "Company that we are interested in trading"]
     asset_type: Annotated[str, "Asset type under analysis such as stock or crypto"]
-    instrument_context: Annotated[str, "Deterministic ticker identity resolved at run start"]
     trade_date: Annotated[str, "What date we are trading at"]
 
     sender: Annotated[str, "Agent that sent this message"]
 
     # research step
     market_report: Annotated[str, "Report from the Market Analyst"]
+    market_features: Annotated[dict, "Structured features extracted from the Market Analyst report"]
     sentiment_report: Annotated[str, "Report from the Sentiment Analyst"]
+    sentiment_features: Annotated[dict, "Structured features extracted from the Sentiment Analyst report"]
     news_report: Annotated[
         str, "Report from the News Researcher of current world affairs"
     ]
+    news_features: Annotated[dict, "Structured features extracted from the News Analyst report"]
     fundamentals_report: Annotated[str, "Report from the Fundamentals Researcher"]
+    fundamentals_features: Annotated[dict, "Structured features extracted from the Fundamentals Analyst report"]
 
     # researcher team discussion step
     investment_debate_state: Annotated[
@@ -73,3 +87,8 @@ class AgentState(MessagesState):
     ]
     final_trade_decision: Annotated[str, "Final decision made by the Risk Analysts"]
     past_context: Annotated[str, "Memory log context injected at run start (same-ticker decisions + cross-ticker lessons)"]
+    time_context: Annotated[dict, "Unified time context used across the run"]
+    data_snapshot: Annotated[dict, "Snapshot of the run inputs and outputs for replay"]
+    factor_score: Annotated[dict, "Deterministic multi-factor score used by stage-two decisioning"]
+    position_sizing: Annotated[dict, "Deterministic position sizing plan"]
+    risk_gate_result: Annotated[dict, "Deterministic hard risk gate decision"]

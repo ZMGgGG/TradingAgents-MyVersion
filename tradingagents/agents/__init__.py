@@ -18,6 +18,9 @@ from .risk_mgmt.neutral_debator import create_neutral_debator
 
 from .managers.research_manager import create_research_manager
 from .managers.portfolio_manager import create_portfolio_manager
+from .managers.factor_manager import create_factor_manager
+from .managers.position_manager import create_position_manager
+from .managers.risk_gate_manager import create_risk_gate_manager
 
 from .trader.trader import create_trader
 
@@ -29,12 +32,15 @@ __all__ = [
     "create_bear_researcher",
     "create_bull_researcher",
     "create_research_manager",
+    "create_factor_manager",
     "create_fundamentals_analyst",
     "create_market_analyst",
     "create_neutral_debator",
     "create_news_analyst",
     "create_aggressive_debator",
     "create_portfolio_manager",
+    "create_position_manager",
+    "create_risk_gate_manager",
     "create_conservative_debator",
     "create_sentiment_analyst",
     "create_social_media_analyst",  # deprecated; will be removed in a future version

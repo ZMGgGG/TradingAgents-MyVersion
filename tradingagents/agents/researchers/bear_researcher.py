@@ -1,21 +1,41 @@
+from tradingagents.agents.schemas import (
+    InvestmentDebateSignal,
+    InvestmentStance,
+    parse_investment_debate_signal,
+    render_investment_debate_signal,
+)
 from tradingagents.agents.utils.agent_utils import (
-    get_instrument_context_from_state,
+    build_compact_feature_context,
+    compact_history,
     get_language_instruction,
+    get_time_context_instruction,
+)
+from tradingagents.agents.utils.debate_signals import (
+    default_investment_signal,
+    summarize_investment_signals,
+)
+from tradingagents.agents.utils.structured import (
+    bind_structured,
+    invoke_structured_or_freetext_result,
 )
 
 
 def create_bear_researcher(llm):
+    structured_llm = bind_structured(llm, InvestmentDebateSignal, "Bear Researcher")
+
     def bear_node(state) -> dict:
         investment_debate_state = state["investment_debate_state"]
         history = investment_debate_state.get("history", "")
+        compact_debate_history = compact_history(history, keep_recent_lines=6)
         bear_history = investment_debate_state.get("bear_history", "")
 
         current_response = investment_debate_state.get("current_response", "")
-        market_research_report = state["market_report"]
-        sentiment_report = state["sentiment_report"]
-        news_report = state["news_report"]
-        fundamentals_report = state["fundamentals_report"]
-        instrument_context = get_instrument_context_from_state(state)
+        feature_context = build_compact_feature_context(state)
+        first_round = investment_debate_state.get("count", 0) == 0
+        market_research_report = state["market_report"] if first_round else "[Use structured feature summary below; full market report omitted after round 1.]"
+        sentiment_report = state["sentiment_report"] if first_round else "[Use structured feature summary below; full sentiment report omitted after round 1.]"
+        news_report = state["news_report"] if first_round else "[Use structured feature summary below; full news report omitted after round 1.]"
+        fundamentals_report = state["fundamentals_report"] if first_round else "[Use structured feature summary below; full fundamentals report omitted after round 1.]"
         asset_type = state.get("asset_type", "stock")
         target_label = "stock" if asset_type == "stock" else "asset"
         fundamentals_label = (
@@ -36,19 +56,56 @@ Key points to focus on:
 
 Resources available:
 
-{instrument_context}
+Structured analyst feature summary:
+{feature_context}
 Market research report: {market_research_report}
 Social media sentiment report: {sentiment_report}
 Latest world affairs news: {news_report}
 {fundamentals_label}: {fundamentals_report}
-Conversation history of the debate: {history}
+Conversation history of the debate: {compact_debate_history}
 Last bull argument: {current_response}
 Use this information to deliver a compelling bear argument, refute the bull's claims, and engage in a dynamic debate that demonstrates the risks and weaknesses of investing in the {target_label}.
-""" + get_language_instruction()
+First write your normal debate response in natural language. Then append a machine-readable summary block in exactly this format:
 
-        response = llm.invoke(prompt)
+STRUCTURED_SUMMARY
+STANCE: Bearish
+SCORE: <0.00 to 1.00>
+CONFIDENCE: <0.00 to 1.00>
+EVIDENCE_QUALITY: <0.00 to 1.00>
+TIME_HORIZON_DAYS: <integer>
+THESIS: <one concise thesis>
+REBUTTAL: <main rebuttal to the bull case>
+KEY_RISKS: <main risks to the bear case>
+END_STRUCTURED_SUMMARY
 
-        argument = f"Bear Analyst: {response.content}"
+Keep the debate body rich and persuasive. The summary block should be brief and only appear once at the end.
+{get_time_context_instruction(state)}""" + get_language_instruction()
+
+        rendered_signal, signal = invoke_structured_or_freetext_result(
+            structured_llm,
+            llm,
+            prompt,
+            render_investment_debate_signal,
+            "Bear Researcher",
+            fallback=lambda text: parse_investment_debate_signal(
+                text,
+                "Bear Researcher",
+                InvestmentStance.BEARISH,
+            ),
+        )
+        signal = signal or default_investment_signal(
+            InvestmentStance.BEARISH,
+            rendered_signal,
+            "Bear Researcher",
+        )
+
+        argument = f"Bear Analyst:\n{rendered_signal}"
+        summary = summarize_investment_signals(
+            InvestmentDebateSignal.model_validate(investment_debate_state["bull_signal"])
+            if investment_debate_state.get("bull_signal")
+            else None,
+            signal,
+        )
 
         new_investment_debate_state = {
             "history": history + "\n" + argument,
@@ -56,6 +113,12 @@ Use this information to deliver a compelling bear argument, refute the bull's cl
             "bull_history": investment_debate_state.get("bull_history", ""),
             "current_response": argument,
             "count": investment_debate_state["count"] + 1,
+            "judge_decision": investment_debate_state.get("judge_decision", ""),
+            "bull_signal": investment_debate_state.get("bull_signal", {}),
+            "bear_signal": signal.model_dump(),
+            "signal_summary": summary["summary"],
+            "signal_score": summary["net_score"],
+            "signal_confidence": summary["average_confidence"],
         }
 
         return {"investment_debate_state": new_investment_debate_state}

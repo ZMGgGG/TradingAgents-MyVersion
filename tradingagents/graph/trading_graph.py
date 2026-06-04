@@ -8,12 +8,15 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Tuple, List, Optional
 
 import yfinance as yf
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
 from langgraph.prebuilt import ToolNode
 
 from tradingagents.llm_clients import create_llm_client
+from tradingagents.backtesting.engine import BacktestResult, BacktestScenario, BatchBacktester
+from tradingagents.core.data_snapshot import DataSnapshot
 
 from tradingagents.agents import *
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -25,11 +28,10 @@ from tradingagents.agents.utils.agent_states import (
     RiskDebateState,
 )
 from tradingagents.dataflows.config import set_config
+from tradingagents.dataflows.interface import route_to_vendor
 
 # Import the new abstract tool methods from agent_utils
 from tradingagents.agents.utils.agent_utils import (
-    build_instrument_context,
-    resolve_instrument_identity,
     get_stock_data,
     get_indicators,
     get_fundamentals,
@@ -124,6 +126,7 @@ class TradingAgentsGraph:
         )
         self.reflector = Reflector(self.quick_thinking_llm)
         self.signal_processor = SignalProcessor(self.quick_thinking_llm)
+        self.backtester = BatchBacktester(self)
 
         # State tracking
         self.curr_state = None
@@ -154,13 +157,6 @@ class TradingAgentsGraph:
             effort = self.config.get("anthropic_effort")
             if effort:
                 kwargs["effort"] = effort
-
-        # Sampling temperature is cross-provider: forward it whenever set.
-        # float() here so a value coming from a TRADINGAGENTS_TEMPERATURE env
-        # string ("0.2") works the same as a programmatic float.
-        temperature = self.config.get("temperature")
-        if temperature is not None and temperature != "":
-            kwargs["temperature"] = float(temperature)
 
         return kwargs
 
@@ -237,11 +233,26 @@ class TradingAgentsGraph:
             end = start + timedelta(days=holding_days + 7)  # buffer for weekends/holidays
             end_str = end.strftime("%Y-%m-%d")
 
-            stock = yf.Ticker(ticker).history(start=trade_date, end=end_str)
-            bench = yf.Ticker(benchmark).history(start=trade_date, end=end_str)
+            stock = self._load_price_history_for_returns(ticker, trade_date, end_str)
 
-            if len(stock) < 2 or len(bench) < 2:
+            if len(stock) < 2:
                 return None, None, None
+
+            bench = self._load_price_history_for_returns(benchmark, trade_date, end_str)
+
+            if len(bench) < 2:
+                actual_days = min(holding_days, len(stock) - 1)
+                raw = float(
+                    (stock["Close"].iloc[actual_days] - stock["Close"].iloc[0])
+                    / stock["Close"].iloc[0]
+                )
+                logger.warning(
+                    "Benchmark %s unavailable for %s on %s; falling back to raw return only",
+                    benchmark,
+                    ticker,
+                    trade_date,
+                )
+                return raw, 0.0, actual_days
 
             actual_days = min(holding_days, len(stock) - 1, len(bench) - 1)
             raw = float(
@@ -260,6 +271,40 @@ class TradingAgentsGraph:
                 ticker, trade_date, benchmark, e,
             )
             return None, None, None
+
+    def _load_price_history_for_returns(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """Load post-analysis price history via the same vendor-compat path used elsewhere."""
+        payload = route_to_vendor("get_stock_data", symbol, start_date, end_date)
+        df = self._parse_price_payload_to_dataframe(payload)
+        if not df.empty:
+            return df
+        return yf.Ticker(symbol).history(start=start_date, end=end_date)
+
+    def _parse_price_payload_to_dataframe(self, payload: Any) -> pd.DataFrame:
+        """Parse a vendor text payload into a normalized OHLCV DataFrame."""
+        if not isinstance(payload, str):
+            return pd.DataFrame()
+        lines = payload.splitlines()
+        csv_lines = [line for line in lines if line and not line.startswith("#")]
+        if not csv_lines:
+            return pd.DataFrame()
+        try:
+            from io import StringIO
+
+            df = pd.read_csv(StringIO("\n".join(csv_lines)))
+        except Exception:
+            return pd.DataFrame()
+
+        if "Date" not in df.columns or "Close" not in df.columns:
+            return pd.DataFrame()
+
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date", "Close"]).sort_values("Date")
+        df = df.set_index("Date")
+        if "Close" in df.columns:
+            df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+            df = df.dropna(subset=["Close"])
+        return df
 
     def _resolve_pending_entries(self, ticker: str) -> None:
         """Resolve pending log entries for ticker at the start of a new run.
@@ -301,18 +346,6 @@ class TradingAgentsGraph:
         if updates:
             self.memory_log.batch_update_with_outcomes(updates)
 
-    def resolve_instrument_context(self, ticker: str, asset_type: str = "stock") -> str:
-        """Resolve ticker identity once and return the full instrument context.
-
-        Deterministic yfinance lookup (cached, fail-open) injected into a
-        context string so every agent anchors to the real company instead of
-        hallucinating one from the price chart (#814). Both the propagate()
-        path and the CLI call this so the resolved identity reaches the whole
-        graph regardless of entry point.
-        """
-        identity = resolve_instrument_identity(ticker)
-        return build_instrument_context(ticker, asset_type, identity)
-
     def propagate(self, company_name, trade_date, asset_type: str = "stock"):
         """Run the trading agents graph for a company on a specific date.
 
@@ -324,6 +357,7 @@ class TradingAgentsGraph:
         successful node on a subsequent invocation with the same ticker+date.
         """
         self.ticker = company_name
+        set_config({"_current_ticker": company_name})
 
         # Resolve any pending memory-log entries for this ticker before the pipeline runs.
         self._resolve_pending_entries(company_name)
@@ -356,16 +390,10 @@ class TradingAgentsGraph:
 
     def _run_graph(self, company_name, trade_date, asset_type: str = "stock"):
         """Execute the graph and write the resulting state to disk and memory log."""
-        # Initialize state — inject memory log context for PM and the
-        # deterministically resolved instrument identity for all agents.
+        # Initialize state — inject memory log context for PM.
         past_context = self.memory_log.get_past_context(company_name)
-        instrument_context = self.resolve_instrument_context(company_name, asset_type)
         init_agent_state = self.propagator.create_initial_state(
-            company_name,
-            trade_date,
-            asset_type=asset_type,
-            past_context=past_context,
-            instrument_context=instrument_context,
+            company_name, trade_date, asset_type=asset_type, past_context=past_context
         )
         args = self.propagator.get_graph_args()
 
@@ -392,6 +420,8 @@ class TradingAgentsGraph:
 
         # Store current state for reflection.
         self.curr_state = final_state
+        final_state.setdefault("time_context", init_agent_state.get("time_context", {}))
+        final_state["data_snapshot"] = DataSnapshot.from_state(final_state).to_log_payload()
 
         # Log state to disk.
         self._log_state(trade_date, final_state)
@@ -416,6 +446,8 @@ class TradingAgentsGraph:
         self.log_states_dict[str(trade_date)] = {
             "company_of_interest": final_state["company_of_interest"],
             "trade_date": final_state["trade_date"],
+            "time_context": final_state.get("time_context", {}),
+            "data_snapshot": final_state.get("data_snapshot", {}),
             "market_report": final_state["market_report"],
             "sentiment_report": final_state["sentiment_report"],
             "news_report": final_state["news_report"],
@@ -430,6 +462,11 @@ class TradingAgentsGraph:
                 "judge_decision": final_state["investment_debate_state"][
                     "judge_decision"
                 ],
+                "bull_signal": final_state["investment_debate_state"].get("bull_signal", {}),
+                "bear_signal": final_state["investment_debate_state"].get("bear_signal", {}),
+                "signal_summary": final_state["investment_debate_state"].get("signal_summary", ""),
+                "signal_score": final_state["investment_debate_state"].get("signal_score", 0.0),
+                "signal_confidence": final_state["investment_debate_state"].get("signal_confidence", 0.0),
             },
             "trader_investment_decision": final_state["trader_investment_plan"],
             "risk_debate_state": {
@@ -438,6 +475,12 @@ class TradingAgentsGraph:
                 "neutral_history": final_state["risk_debate_state"]["neutral_history"],
                 "history": final_state["risk_debate_state"]["history"],
                 "judge_decision": final_state["risk_debate_state"]["judge_decision"],
+                "aggressive_signal": final_state["risk_debate_state"].get("aggressive_signal", {}),
+                "conservative_signal": final_state["risk_debate_state"].get("conservative_signal", {}),
+                "neutral_signal": final_state["risk_debate_state"].get("neutral_signal", {}),
+                "signal_summary": final_state["risk_debate_state"].get("signal_summary", ""),
+                "signal_score": final_state["risk_debate_state"].get("signal_score", 0.0),
+                "signal_confidence": final_state["risk_debate_state"].get("signal_confidence", 0.0),
             },
             "investment_plan": final_state["investment_plan"],
             "final_trade_decision": final_state["final_trade_decision"],
@@ -456,3 +499,24 @@ class TradingAgentsGraph:
     def process_signal(self, full_signal):
         """Process a signal to extract the core decision."""
         return self.signal_processor.process_signal(full_signal)
+
+    def run_batch_backtest(
+        self,
+        scenarios: List[BacktestScenario],
+        holding_days: int = 5,
+    ) -> BacktestResult:
+        """Run a baseline batch backtest over multiple scenarios."""
+        return self.backtester.run(scenarios, holding_days=holding_days)
+
+    def run_backtest_from_final_states(
+        self,
+        scenarios: List[BacktestScenario],
+        final_states: List[dict[str, Any]],
+        holding_days: int = 5,
+    ) -> BacktestResult:
+        """Backtest already-computed analysis results without re-running the graph."""
+        return self.backtester.run_from_final_states(
+            scenarios,
+            final_states,
+            holding_days=holding_days,
+        )

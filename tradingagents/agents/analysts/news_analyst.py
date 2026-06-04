@@ -1,19 +1,24 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from tradingagents.agents.schemas import parse_analyst_feature_summary
 from tradingagents.agents.utils.agent_utils import (
-    get_instrument_context_from_state,
+    build_instrument_context,
     get_global_news,
     get_language_instruction,
     get_news,
+    get_time_context_from_state,
 )
 from tradingagents.dataflows.config import get_config
 
 
 def create_news_analyst(llm):
     def news_analyst_node(state):
-        current_date = state["trade_date"]
+        time_context = get_time_context_from_state(state)
+        current_date = time_context.as_of_date
         asset_type = state.get("asset_type", "stock")
         asset_label = "company" if asset_type == "stock" else "asset"
-        instrument_context = get_instrument_context_from_state(state)
+        instrument_context = build_instrument_context(
+            state["company_of_interest"], asset_type
+        ) + " " + time_context.to_prompt_string()
 
         tools = [
             get_news,
@@ -23,6 +28,7 @@ def create_news_analyst(llm):
         system_message = (
             f"You are a news researcher tasked with analyzing recent news and trends over the past week. Please write a comprehensive report of the current state of the world that is relevant for trading and macroeconomics. Use the available tools: get_news(query, start_date, end_date) for {asset_label}-specific or targeted news searches, and get_global_news(curr_date, look_back_days, limit) for broader macroeconomic news. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."
             + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
+            + " After the full report, append exactly one machine-readable block in this format: FEATURE_SUMMARY / SCORE / CONFIDENCE / KEY_SIGNAL / RISK_FLAG / END_FEATURE_SUMMARY."
             + get_language_instruction()
         )
 
@@ -52,13 +58,16 @@ def create_news_analyst(llm):
         result = chain.invoke(state["messages"])
 
         report = ""
+        features = {}
 
         if len(result.tool_calls) == 0:
             report = result.content
+            features = parse_analyst_feature_summary(report).model_dump()
 
         return {
             "messages": [result],
             "news_report": report,
+            "news_features": features,
         }
 
     return news_analyst_node

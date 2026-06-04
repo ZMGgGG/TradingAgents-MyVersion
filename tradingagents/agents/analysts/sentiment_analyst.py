@@ -14,30 +14,20 @@ the LLM is invoked and injects them into the prompt as structured blocks:
   3. Reddit posts        — r/wallstreetbets, r/stocks, r/investing
 
 The agent does not use tool-calling; the data is in the prompt from
-turn 0. Output uses the structured-output pattern (json_schema for
-OpenAI/xAI, response_schema for Gemini, tool-use for Anthropic), falling
-back to free-text generation for providers that lack native support, so
-the sentiment header (band + score + confidence) is deterministic across
-runs and providers instead of free-form per-model prose.
+turn 0. The LLM produces the sentiment report in a single invocation.
 
 See: https://github.com/TauricResearch/TradingAgents/issues/557
-See: https://github.com/TauricResearch/TradingAgents/issues/796
 """
 
 from datetime import datetime, timedelta
 
-from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-
-from tradingagents.agents.schemas import SentimentReport, render_sentiment_report
+from tradingagents.agents.schemas import parse_analyst_feature_summary
 from tradingagents.agents.utils.agent_utils import (
-    get_instrument_context_from_state,
+    build_instrument_context,
     get_language_instruction,
     get_news,
-)
-from tradingagents.agents.utils.structured import (
-    bind_structured,
-    invoke_structured_or_freetext,
+    get_time_context_from_state,
 )
 from tradingagents.dataflows.reddit import fetch_reddit_posts
 from tradingagents.dataflows.stocktwits import fetch_stocktwits_messages
@@ -51,24 +41,32 @@ def create_sentiment_analyst(llm):
     """Create a sentiment analyst node for the trading graph.
 
     Pre-fetches news + StockTwits + Reddit data, injects them into the
-    prompt as structured blocks, and produces a deterministic sentiment
-    report via structured output (with a free-text fallback for providers
-    that do not support it).
+    prompt as structured blocks, and produces a sentiment report in a
+    single LLM call.
     """
-    structured_llm = bind_structured(llm, SentimentReport, "Sentiment Analyst")
 
     def sentiment_analyst_node(state):
         ticker = state["company_of_interest"]
-        end_date = state["trade_date"]
-        start_date = _seven_days_back(end_date)
-        instrument_context = get_instrument_context_from_state(state)
+        time_context = get_time_context_from_state(state)
+        end_date = time_context.as_of_date
+        start_date = time_context.news_start_date(7)
+        instrument_context = build_instrument_context(ticker) + " " + time_context.to_prompt_string()
+        is_cn_ticker = ticker.upper().endswith(".SS") or ticker.upper().endswith(".SZ")
 
         # Pre-fetch all three sources. Each fetcher degrades gracefully and
         # returns a string (no exceptions surface from here), so the LLM
         # always sees something — either real data or a clear placeholder.
         news_block = get_news.func(ticker, start_date, end_date)
-        stocktwits_block = fetch_stocktwits_messages(ticker, limit=30)
-        reddit_block = fetch_reddit_posts(ticker)
+        stocktwits_block = (
+            _fetch_cn_sentiment_proxy(ticker)
+            if is_cn_ticker
+            else fetch_stocktwits_messages(ticker, limit=30)
+        )
+        reddit_block = (
+            _fetch_cn_forum_proxy(ticker)
+            if is_cn_ticker
+            else fetch_reddit_posts(ticker)
+        )
 
         system_message = _build_system_message(
             ticker=ticker,
@@ -77,6 +75,7 @@ def create_sentiment_analyst(llm):
             news_block=news_block,
             stocktwits_block=stocktwits_block,
             reddit_block=reddit_block,
+            is_cn_ticker=is_cn_ticker,
         )
 
         prompt = ChatPromptTemplate.from_messages(
@@ -97,22 +96,16 @@ def create_sentiment_analyst(llm):
         prompt = prompt.partial(current_date=end_date)
         prompt = prompt.partial(instrument_context=instrument_context)
 
-        # Format the template into a concrete message list so the structured
-        # and free-text paths receive the same input. No bind_tools — the
-        # data is already in the prompt.
-        formatted_messages = prompt.format_messages(messages=state["messages"])
-
-        report_text = invoke_structured_or_freetext(
-            structured_llm,
-            llm,
-            formatted_messages,
-            render_sentiment_report,
-            "Sentiment Analyst",
-        )
+        # No bind_tools — the data is already in the prompt; a single LLM
+        # call produces the report directly.
+        chain = prompt | llm
+        result = chain.invoke(state["messages"])
+        features = parse_analyst_feature_summary(result.content)
 
         return {
-            "messages": [AIMessage(content=report_text)],
-            "sentiment_report": report_text,
+            "messages": [result],
+            "sentiment_report": result.content,
+            "sentiment_features": features.model_dump(),
         }
 
     return sentiment_analyst_node
@@ -126,8 +119,14 @@ def _build_system_message(
     news_block: str,
     stocktwits_block: str,
     reddit_block: str,
+    is_cn_ticker: bool,
 ) -> str:
     """Assemble the sentiment-analyst system message with structured data blocks."""
+    stocktwits_label = "StockTwits messages — retail-trader social platform indexed by cashtag"
+    reddit_label = "Reddit posts — r/wallstreetbets, r/stocks, r/investing (past 7 days)"
+    if is_cn_ticker:
+        stocktwits_label = "CN social sentiment proxy — unavailable in current pipeline"
+        reddit_label = "CN forum sentiment proxy — unavailable in current pipeline"
     return f"""You are a financial market sentiment analyst. Your task is to produce a comprehensive sentiment report for {ticker} covering the period from {start_date} to {end_date}, drawing on three complementary data sources that have already been collected for you.
 
 ## Data sources (pre-fetched, in this prompt)
@@ -139,14 +138,14 @@ Institutional framing. Fact-driven, slower-moving signal.
 {news_block}
 <end_of_news>
 
-### StockTwits messages — retail-trader social platform indexed by cashtag
+### {stocktwits_label}
 Fast-moving signal. Each message carries a user-labeled sentiment tag (Bullish / Bearish / no-label) plus the message body.
 
 <start_of_stocktwits>
 {stocktwits_block}
 <end_of_stocktwits>
 
-### Reddit posts — r/wallstreetbets, r/stocks, r/investing (past 7 days)
+### {reddit_label}
 Community discussion. Engagement signal via upvote score and comment count. Subreddit character matters (r/wallstreetbets is often contrarian/exuberant; r/stocks more measured; r/investing longer-term).
 
 <start_of_reddit>
@@ -165,20 +164,29 @@ Community discussion. Engagement signal via upvote score and comment count. Subr
 
 5. **Identify recurring narrative themes.** What topic keeps coming up across sources? That's the dominant narrative driving current sentiment.
 
-6. **Be honest about data limits.** If StockTwits returned only a handful of messages, or one or more sources returned an "<unavailable>" placeholder, the sentiment read is less robust — flag this explicitly in the `confidence` field and the narrative. If the sources are silent on a given subreddit, say so.
+6. **Be honest about data limits.** If StockTwits returned only a handful of messages, or one or more sources returned an "<unavailable>" placeholder, the sentiment read is less robust — flag this caveat explicitly. If the sources are silent on a given subreddit, say so.
 
 7. **Identify catalysts and risks** that emerge across sources — news of upcoming earnings, product launches, competitive threats, macro headlines, etc.
 
 8. **Past sentiment is not predictive.** Frame your conclusions as signal for the trader to weigh alongside fundamentals and technicals, not as a price call.
 
-## Output fields
+## Output
 
-Fill the following fields:
+Produce a sentiment report covering, in order:
 
-- **overall_band**: Exactly one of Bullish / Mildly Bullish / Neutral / Mixed / Mildly Bearish / Bearish. Use Mixed when sources point in clearly different directions; Neutral only when all sources are genuinely silent.
-- **overall_score**: A number from 0 (maximally bearish) to 10 (maximally bullish); 5 is neutral. Keep it consistent with overall_band.
-- **confidence**: low / medium / high, based on data quality and sample size.
-- **narrative**: Full source-by-source breakdown, divergences, dominant narrative themes, catalysts and risks, and a markdown summary table of key sentiment signals (direction, source, supporting evidence).
+1. **Overall sentiment direction** — Bullish / Bearish / Neutral / Mixed — with a brief confidence note based on data quality and sample size.
+2. **Source-by-source breakdown** — what each of news / StockTwits / Reddit is telling you, with specific evidence (cite message counts, ratios, notable posts).
+3. **Divergences, alignments, and key narratives** across sources.
+4. **Catalysts and risks** surfaced by the data.
+5. **Markdown table** at the end summarizing key sentiment signals, their direction, source, and supporting evidence.
+6. After the full report, append exactly one machine-readable block in this format:
+
+FEATURE_SUMMARY
+SCORE: <value from -1.00 to 1.00>
+CONFIDENCE: <value from 0.00 to 1.00>
+KEY_SIGNAL: <concise sentiment signal>
+RISK_FLAG: <main sentiment or data caveat>
+END_FEATURE_SUMMARY
 
 {get_language_instruction()}"""
 
@@ -195,6 +203,61 @@ def create_social_media_analyst(llm):
     .. deprecated::
         Import :func:`create_sentiment_analyst` directly instead.
     """
+
+
+def _fetch_cn_sentiment_proxy(ticker: str) -> str:
+    """Fetch A-share popularity / comment style sentiment proxies."""
+    try:
+        import akshare as ak
+    except ImportError:
+        return "<CN retail sentiment proxy unavailable>"
+    code = ticker.upper().split(".")[0]
+    blocks = []
+    for fetcher in (
+        getattr(ak, "stock_hot_rank_detail_em", None),
+        getattr(ak, "stock_comment_em", None),
+    ):
+        if fetcher is None:
+            continue
+        try:
+            df = fetcher(symbol=code)
+        except Exception:
+            continue
+        if df is not None and not df.empty:
+            blocks.append(df.head(10).to_csv(index=False))
+    if not blocks:
+        return "<CN retail sentiment proxy unavailable>"
+    return "\n\n".join(blocks)
+
+
+def _fetch_cn_forum_proxy(ticker: str) -> str:
+    """Fetch A-share discussion proxies from AKShare ranking / notice data."""
+    try:
+        import akshare as ak
+    except ImportError:
+        return "<CN forum / attention proxy unavailable>"
+    code = ticker.upper().split(".")[0]
+    blocks = []
+    for fetcher in (
+        getattr(ak, "stock_hot_rank_em", None),
+        getattr(ak, "stock_individual_notice_report", None),
+    ):
+        if fetcher is None:
+            continue
+        try:
+            if fetcher.__name__ == "stock_individual_notice_report":
+                df = fetcher(symbol=code)
+            else:
+                df = fetcher()
+        except Exception:
+            continue
+        if df is not None and not df.empty:
+            if "代码" in df.columns:
+                df = df[df["代码"].astype(str) == code]
+            blocks.append(df.head(10).to_csv(index=False))
+    if not blocks:
+        return "<CN forum / attention proxy unavailable>"
+    return "\n\n".join(blocks)
     import warnings
     warnings.warn(
         "create_social_media_analyst is deprecated and will be removed in a "

@@ -1,5 +1,4 @@
 from typing import Optional
-import os
 import datetime
 import typer
 import questionary
@@ -28,6 +27,7 @@ from tradingagents.graph.analyst_execution import (
     get_initial_analyst_node,
     sync_analyst_tracker_from_chunk,
 )
+from tradingagents.backtesting import BacktestScenario
 from tradingagents.default_config import DEFAULT_CONFIG
 from cli.models import AnalystType
 from cli.utils import *
@@ -506,18 +506,15 @@ def get_user_selections():
     console.print(
         create_question_box(
             "Step 1: Ticker Symbol",
-            "Enter the ticker, with exchange suffix when needed (e.g. SPY, 0700.HK, BTC-USD)",
+            "Enter the exact ticker symbol to analyze, including exchange suffix when needed (examples: SPY, CNC.TO, 7203.T, 0700.HK)",
             "SPY",
         )
     )
     selected_ticker = get_ticker()
     asset_type = detect_asset_type(selected_ticker)
-    # Only announce when it's not the default stock path, to avoid printing
-    # "stock" on every run.
-    if asset_type.value != "stock":
-        console.print(
-            f"[green]Detected asset type:[/green] {asset_type.value}"
-        )
+    console.print(
+        f"[green]Detected asset type:[/green] {asset_type.value}"
+    )
 
     # Step 2: Analysis date
     default_date = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -530,20 +527,14 @@ def get_user_selections():
     )
     analysis_date = get_analysis_date()
 
-    # Step 3: Output language (skipped when set via TRADINGAGENTS_OUTPUT_LANGUAGE)
-    if os.environ.get("TRADINGAGENTS_OUTPUT_LANGUAGE"):
-        output_language = DEFAULT_CONFIG["output_language"]
-        console.print(
-            f"[green]✓ Output language from environment:[/green] {output_language}"
+    # Step 3: Output language
+    console.print(
+        create_question_box(
+            "Step 3: Output Language",
+            "Select the language for analyst reports and final decision"
         )
-    else:
-        console.print(
-            create_question_box(
-                "Step 3: Output Language",
-                "Select the language for analyst reports and final decision"
-            )
-        )
-        output_language = ask_output_language()
+    )
+    output_language = ask_output_language()
 
     # Step 4: Select analysts
     console.print(
@@ -564,62 +555,42 @@ def get_user_selections():
     )
     selected_research_depth = select_research_depth()
 
-    # Step 6: LLM Provider (skipped when set via TRADINGAGENTS_LLM_PROVIDER).
-    # The backend URL comes from TRADINGAGENTS_LLM_BACKEND_URL when set,
-    # otherwise the provider's default endpoint — the same value the menu
-    # would have picked.
-    provider_from_env = bool(os.environ.get("TRADINGAGENTS_LLM_PROVIDER"))
-    if provider_from_env:
-        selected_llm_provider = DEFAULT_CONFIG["llm_provider"].lower()
-        backend_url = DEFAULT_CONFIG["backend_url"] or provider_default_url(selected_llm_provider)
-        console.print(f"[green]✓ LLM provider from environment:[/green] {selected_llm_provider}")
-        console.print(f"[green]✓ Backend URL:[/green] {backend_url}")
-        # Still confirm/persist the API key so the run doesn't fail later.
-        ensure_api_key(selected_llm_provider)
-    else:
-        console.print(
-            create_question_box(
-                "Step 6: LLM Provider", "Select your LLM provider"
-            )
+    # Step 6: LLM Provider
+    console.print(
+        create_question_box(
+            "Step 6: LLM Provider", "Select your LLM provider"
         )
-        selected_llm_provider, backend_url = select_llm_provider()
+    )
+    selected_llm_provider, backend_url = select_llm_provider()
 
-        # Providers with regional endpoints prompt for the region as a secondary
-        # step so the main dropdown stays clean (mainland China and international
-        # accounts cannot share API keys).
-        if selected_llm_provider == "qwen":
-            selected_llm_provider, backend_url = ask_qwen_region()
-        elif selected_llm_provider == "minimax":
-            selected_llm_provider, backend_url = ask_minimax_region()
-        elif selected_llm_provider == "glm":
-            selected_llm_provider, backend_url = ask_glm_region()
+    # Providers with regional endpoints prompt for the region as a secondary
+    # step so the main dropdown stays clean (mainland China and international
+    # accounts cannot share API keys).
+    if selected_llm_provider == "qwen":
+        selected_llm_provider, backend_url = ask_qwen_region()
+    elif selected_llm_provider == "minimax":
+        selected_llm_provider, backend_url = ask_minimax_region()
+    elif selected_llm_provider == "glm":
+        selected_llm_provider, backend_url = ask_glm_region()
 
-        # For Ollama, surface the resolved endpoint (OLLAMA_BASE_URL vs default)
-        # before model selection so it's obvious where we're connecting.
-        if selected_llm_provider == "ollama":
-            confirm_ollama_endpoint(backend_url)
+    # For Ollama, surface the resolved endpoint (OLLAMA_BASE_URL vs default)
+    # before model selection so it's obvious where we're connecting.
+    if selected_llm_provider == "ollama":
+        confirm_ollama_endpoint(backend_url)
 
-        # Confirm the provider's API key is present; prompt the user to paste
-        # one and persist it to .env if it's missing, so the analysis run
-        # doesn't fail later at the first API call.
-        ensure_api_key(selected_llm_provider)
+    # Confirm the provider's API key is present; prompt the user to paste
+    # one and persist it to .env if it's missing, so the analysis run
+    # doesn't fail later at the first API call.
+    ensure_api_key(selected_llm_provider)
 
-    # Step 7: Thinking agents (skipped when either model is set via environment)
-    if os.environ.get("TRADINGAGENTS_QUICK_THINK_LLM") or os.environ.get("TRADINGAGENTS_DEEP_THINK_LLM"):
-        selected_shallow_thinker = DEFAULT_CONFIG["quick_think_llm"]
-        selected_deep_thinker = DEFAULT_CONFIG["deep_think_llm"]
-        console.print(
-            f"[green]✓ Thinking agents from environment:[/green] "
-            f"quick={selected_shallow_thinker}, deep={selected_deep_thinker}"
+    # Step 7: Thinking agents
+    console.print(
+        create_question_box(
+            "Step 7: Thinking Agents", "Select your thinking agents for analysis"
         )
-    else:
-        console.print(
-            create_question_box(
-                "Step 7: Thinking Agents", "Select your thinking agents for analysis"
-            )
-        )
-        selected_shallow_thinker = select_shallow_thinking_agent(selected_llm_provider)
-        selected_deep_thinker = select_deep_thinking_agent(selected_llm_provider)
+    )
+    selected_shallow_thinker = select_shallow_thinking_agent(selected_llm_provider)
+    selected_deep_thinker = select_deep_thinking_agent(selected_llm_provider)
 
     # Step 8: Provider-specific thinking configuration
     thinking_level = None
@@ -627,14 +598,7 @@ def get_user_selections():
     anthropic_effort = None
 
     provider_lower = selected_llm_provider.lower()
-    # When the provider is configured via environment we keep the run fully
-    # non-interactive and use the config defaults (None = each provider's own
-    # default reasoning/thinking behavior) instead of prompting.
-    if provider_from_env:
-        thinking_level = DEFAULT_CONFIG["google_thinking_level"]
-        reasoning_effort = DEFAULT_CONFIG["openai_reasoning_effort"]
-        anthropic_effort = DEFAULT_CONFIG["anthropic_effort"]
-    elif provider_lower == "google":
+    if provider_lower == "google":
         console.print(
             create_question_box(
                 "Step 8: Thinking Mode",
@@ -676,6 +640,29 @@ def get_user_selections():
     }
 
 
+def get_ticker():
+    """Get ticker symbol from user input, preserving exchange suffixes."""
+    # typer.prompt strips trailing dot-suffixes on some shells (e.g. 000404.SH
+    # collapses to 000404). questionary.text reads the raw line.
+    ticker = questionary.text(
+        "",
+        validate=lambda value: (
+            not value.strip()
+            or (
+                all(ch.isalnum() or ch in "._-^" for ch in value.strip())
+                and len(value.strip()) <= 32
+            )
+        )
+        or "Please enter a valid ticker symbol, e.g. AAPL, 000404.SZ, 0700.HK.",
+    ).ask()
+
+    if ticker is None:
+        console.print("\n[red]No ticker symbol provided. Exiting...[/red]")
+        raise typer.Exit(1)
+
+    return (ticker.strip() or "SPY").upper()
+
+
 def get_analysis_date():
     """Get the analysis date from user input."""
     while True:
@@ -693,6 +680,32 @@ def get_analysis_date():
             console.print(
                 "[red]Error: Invalid date format. Please use YYYY-MM-DD[/red]"
             )
+
+
+def _summary_block_status(text: str) -> str:
+    if not text or not isinstance(text, str):
+        return "missing"
+    if "STRUCTURED_SUMMARY" in text and "END_STRUCTURED_SUMMARY" in text:
+        return "present"
+    return "absent"
+
+
+def build_structured_summary_status(final_state) -> list[tuple[str, str]]:
+    statuses = []
+
+    debate = final_state.get("investment_debate_state", {})
+    risk = final_state.get("risk_debate_state", {})
+
+    statuses.append(("Bull Researcher", _summary_block_status(debate.get("bull_history", ""))))
+    statuses.append(("Bear Researcher", _summary_block_status(debate.get("bear_history", ""))))
+    statuses.append(("Research Manager", _summary_block_status(debate.get("judge_decision", ""))))
+    statuses.append(("Trader", _summary_block_status(final_state.get("trader_investment_plan", ""))))
+    statuses.append(("Aggressive Analyst", _summary_block_status(risk.get("aggressive_history", ""))))
+    statuses.append(("Conservative Analyst", _summary_block_status(risk.get("conservative_history", ""))))
+    statuses.append(("Neutral Analyst", _summary_block_status(risk.get("neutral_history", ""))))
+    statuses.append(("Portfolio Manager", _summary_block_status(risk.get("judge_decision", ""))))
+
+    return statuses
 
 
 def save_report_to_disk(final_state, ticker: str, save_path: Path):
@@ -781,14 +794,38 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
 
     # Write consolidated report
     header = f"# Trading Analysis Report: {ticker}\n\nGenerated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-    (save_path / "complete_report.md").write_text(header + "\n\n".join(sections), encoding="utf-8")
+    statuses = build_structured_summary_status(final_state)
+    status_lines = "\n".join(f"- {agent}: {status}" for agent, status in statuses)
+    status_section = f"## 0. Structured Summary Status\n\n{status_lines}\n\n"
+    (save_path / "complete_report.md").write_text(
+        header + status_section + "\n\n".join(sections),
+        encoding="utf-8",
+    )
     return save_path / "complete_report.md"
+
+
+def append_backtest_summary_to_report(report_file: Path, summary_file: Path):
+    """Append saved backtest summary markdown to the end of complete_report.md."""
+    if not report_file.exists() or not summary_file.exists():
+        return
+    report_text = report_file.read_text(encoding="utf-8")
+    summary_text = summary_file.read_text(encoding="utf-8")
+    merged = report_text.rstrip() + "\n\n---\n\n## VI. Backtest Summary\n\n" + summary_text + "\n"
+    report_file.write_text(merged, encoding="utf-8")
 
 
 def display_complete_report(final_state):
     """Display the complete analysis report sequentially (avoids truncation)."""
     console.print()
     console.print(Rule("Complete Analysis Report", style="bold green"))
+
+    statuses = build_structured_summary_status(final_state)
+    status_table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
+    status_table.add_column("Agent", style="cyan")
+    status_table.add_column("Summary Block", style="yellow")
+    for agent, status in statuses:
+        status_table.add_row(agent, status)
+    console.print(Panel(status_table, title="Structured Summary Status", border_style="green"))
 
     # I. Analyst Team Reports
     analysts = []
@@ -844,6 +881,192 @@ def display_complete_report(final_state):
         if risk.get("judge_decision"):
             console.print(Panel("[bold]V. Portfolio Manager Decision[/bold]", border_style="green"))
             console.print(Panel(Markdown(risk["judge_decision"]), title="Portfolio Manager", border_style="blue", padding=(1, 2)))
+
+
+def display_backtest_result(result, ticker: str, trade_date: str, holding_days: int):
+    """Display a minimal backtest result for the current analysis scenario."""
+    console.print()
+    console.print(Rule("Backtest Result", style="bold yellow"))
+
+    if not result.trades:
+        console.print(
+            Panel(
+                f"No backtest trade could be resolved for {ticker} on {trade_date}.\n"
+                "This usually means future price data is not yet available for the requested holding window.",
+                title="Backtest",
+                border_style="yellow",
+                padding=(1, 2),
+            )
+        )
+        return
+
+    trade = result.trades[0]
+    trade_table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
+    trade_table.add_column("Field", style="cyan")
+    trade_table.add_column("Value", style="green")
+    trade_table.add_row("Ticker", trade.ticker)
+    trade_table.add_row("Trade Date", trade.trade_date)
+    trade_table.add_row("Rating", trade.rating)
+    trade_table.add_row("Holding Days", str(trade.holding_days))
+    trade_table.add_row("Benchmark", trade.benchmark)
+    trade_table.add_row("Raw Return", f"{trade.raw_return:.2%}")
+    trade_table.add_row("Alpha Return", f"{trade.alpha_return:.2%}")
+    trade_table.add_row("Confidence", f"{trade.confidence:.2%}")
+
+    metrics = result.metrics
+    metrics_table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
+    metrics_table.add_column("Metric", style="cyan")
+    metrics_table.add_column("Value", style="green")
+    metrics_table.add_row("Trade Count", str(metrics.trade_count))
+    metrics_table.add_row("Total Return", f"{metrics.total_return:.2%}")
+    metrics_table.add_row("Average Return", f"{metrics.average_return:.2%}")
+    metrics_table.add_row("Average Alpha", f"{metrics.average_alpha:.2%}")
+    metrics_table.add_row("Win Rate", f"{metrics.win_rate:.2%}")
+    metrics_table.add_row("Loss Rate", f"{metrics.loss_rate:.2%}")
+    metrics_table.add_row("Volatility", f"{metrics.volatility:.4f}")
+    metrics_table.add_row("Sharpe Ratio", f"{metrics.sharpe_ratio:.4f}")
+    metrics_table.add_row("Max Drawdown", f"{metrics.max_drawdown:.2%}")
+
+    console.print(Panel(trade_table, title=f"Scenario Backtest ({holding_days}d)", border_style="yellow"))
+    console.print(Panel(metrics_table, title="Backtest Metrics", border_style="yellow"))
+
+
+def save_backtest_result_to_disk(result, ticker: str, trade_date: str, holding_days: int, save_path: Path):
+    """Save a single backtest result to disk."""
+    save_path.mkdir(parents=True, exist_ok=True)
+    file_path = save_path / f"backtest_{ticker}_{trade_date}_{holding_days}d.md"
+
+    lines = [
+        f"# Backtest Result: {ticker}",
+        "",
+        f"- Trade Date: {trade_date}",
+        f"- Holding Days: {holding_days}",
+        "",
+    ]
+
+    if not result.trades:
+        lines.extend([
+            "## Outcome",
+            "",
+            "No backtest trade could be resolved for this scenario.",
+        ])
+    else:
+        trade = result.trades[0]
+        metrics = result.metrics
+        lines.extend([
+            "## Trade",
+            "",
+            f"- Rating: {trade.rating}",
+            f"- Benchmark: {trade.benchmark}",
+            f"- Raw Return: {trade.raw_return:.2%}",
+            f"- Alpha Return: {trade.alpha_return:.2%}",
+            f"- Confidence: {trade.confidence:.2%}",
+            "",
+            "## Metrics",
+            "",
+            f"- Trade Count: {metrics.trade_count}",
+            f"- Total Return: {metrics.total_return:.2%}",
+            f"- Average Return: {metrics.average_return:.2%}",
+            f"- Average Alpha: {metrics.average_alpha:.2%}",
+            f"- Win Rate: {metrics.win_rate:.2%}",
+            f"- Loss Rate: {metrics.loss_rate:.2%}",
+            f"- Volatility: {metrics.volatility:.4f}",
+            f"- Sharpe Ratio: {metrics.sharpe_ratio:.4f}",
+            f"- Max Drawdown: {metrics.max_drawdown:.2%}",
+        ])
+
+    file_path.write_text("\n".join(lines), encoding="utf-8")
+    return file_path
+
+
+def parse_holding_days_input(raw: str) -> list[int]:
+    raw = raw.replace("，", ",").replace(" ", "")
+    values = []
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        values.append(max(1, int(token)))
+    return values or [5]
+
+
+def display_backtest_summary(results: list[tuple[int, object]]):
+    """Display a compact multi-horizon backtest summary table."""
+    console.print()
+    console.print(Rule("Backtest Summary", style="bold yellow"))
+
+    summary_table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
+    summary_table.add_column("Holding Days", style="cyan")
+    summary_table.add_column("Trade Count", style="green")
+    summary_table.add_column("Rating", style="yellow")
+    summary_table.add_column("Raw Return", style="green")
+    summary_table.add_column("Alpha Return", style="green")
+    summary_table.add_column("Win Rate", style="green")
+    summary_table.add_column("Sharpe", style="green")
+    summary_table.add_column("Max DD", style="green")
+
+    for holding_days, result in results:
+        if result.trades:
+            trade = result.trades[0]
+            metrics = result.metrics
+            summary_table.add_row(
+                str(holding_days),
+                str(metrics.trade_count),
+                trade.rating,
+                f"{trade.raw_return:.2%}",
+                f"{trade.alpha_return:.2%}",
+                f"{metrics.win_rate:.2%}",
+                f"{metrics.sharpe_ratio:.4f}",
+                f"{metrics.max_drawdown:.2%}",
+            )
+        else:
+            summary_table.add_row(
+                str(holding_days),
+                "0",
+                "N/A",
+                "N/A",
+                "N/A",
+                "N/A",
+                "N/A",
+                "N/A",
+            )
+
+    console.print(Panel(summary_table, title="Multi-Horizon Comparison", border_style="yellow"))
+
+
+def save_backtest_summary_to_disk(
+    results: list[tuple[int, object]],
+    ticker: str,
+    trade_date: str,
+    save_path: Path,
+):
+    """Save a compact multi-horizon backtest summary markdown file."""
+    save_path.mkdir(parents=True, exist_ok=True)
+    file_path = save_path / f"backtest_summary_{ticker}_{trade_date}.md"
+
+    lines = [
+        f"# Backtest Summary: {ticker}",
+        "",
+        f"- Trade Date: {trade_date}",
+        "",
+        "| Holding Days | Trade Count | Rating | Raw Return | Alpha Return | Win Rate | Sharpe | Max Drawdown |",
+        "|---|---:|---|---:|---:|---:|---:|---:|",
+    ]
+
+    for holding_days, result in results:
+        if result.trades:
+            trade = result.trades[0]
+            metrics = result.metrics
+            lines.append(
+                f"| {holding_days} | {metrics.trade_count} | {trade.rating} | "
+                f"{trade.raw_return:.2%} | {trade.alpha_return:.2%} | "
+                f"{metrics.win_rate:.2%} | {metrics.sharpe_ratio:.4f} | {metrics.max_drawdown:.2%} |"
+            )
+        else:
+            lines.append(f"| {holding_days} | 0 | N/A | N/A | N/A | N/A | N/A | N/A |")
+
+    file_path.write_text("\n".join(lines), encoding="utf-8")
+    return file_path
 
 
 def update_research_team_status(status):
@@ -1090,8 +1313,7 @@ def run_analysis(checkpoint: bool = False):
 
         # Add initial messages
         message_buffer.add_message("System", f"Selected ticker: {selections['ticker']}")
-        if selections["asset_type"] != "stock":
-            message_buffer.add_message("System", f"Detected asset type: {selections['asset_type']}")
+        message_buffer.add_message("System", f"Detected asset type: {selections['asset_type']}")
         message_buffer.add_message(
             "System", f"Analysis date: {selections['analysis_date']}"
         )
@@ -1113,18 +1335,11 @@ def run_analysis(checkpoint: bool = False):
         )
         update_display(layout, spinner_text, stats_handler=stats_handler, start_time=start_time)
 
-        # Initialize state and get graph args with callbacks.
-        # Resolve the instrument identity once here so all agents anchor to
-        # the real company (#814); the CLI builds state directly rather than
-        # going through propagate(), so this must happen on the CLI path too.
-        instrument_context = graph.resolve_instrument_context(
-            selections["ticker"], selections["asset_type"]
-        )
+        # Initialize state and get graph args with callbacks
         init_agent_state = graph.propagator.create_initial_state(
             selections["ticker"],
             selections["analysis_date"],
             asset_type=selections["asset_type"],
-            instrument_context=instrument_context,
         )
         # Pass callbacks to graph config for tool execution tracking
         # (LLM tracking is handled separately via LLM constructor)
@@ -1264,6 +1479,8 @@ def run_analysis(checkpoint: bool = False):
 
     # Prompt to save report
     save_choice = typer.prompt("Save report?", default="Y").strip().upper()
+    report_save_path = None
+    report_file = None
     if save_choice in ("Y", "YES", ""):
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         default_path = Path.cwd() / "reports" / f"{selections['ticker']}_{timestamp}"
@@ -1272,12 +1489,77 @@ def run_analysis(checkpoint: bool = False):
             default=str(default_path)
         ).strip()
         save_path = Path(save_path_str)
+        report_save_path = save_path
         try:
             report_file = save_report_to_disk(final_state, selections["ticker"], save_path)
             console.print(f"\n[green]✓ Report saved to:[/green] {save_path.resolve()}")
             console.print(f"  [dim]Complete report:[/dim] {report_file.name}")
         except Exception as e:
             console.print(f"[red]Error saving report: {e}[/red]")
+
+    # Prompt to run a minimal forward backtest for the current historical scenario
+    backtest_choice = typer.prompt(
+        "\nRun backtest on this analysis result using future historical data?",
+        default="N",
+    ).strip().upper()
+    if backtest_choice in ("Y", "YES"):
+        holding_days_raw = typer.prompt(
+            "Holding days for backtest (comma-separated)",
+            default="5,10,20",
+        ).strip()
+        try:
+            holding_days_list = parse_holding_days_input(holding_days_raw)
+        except ValueError:
+            console.print("[yellow]Invalid holding days; using default 5,10,20.[/yellow]")
+            holding_days_list = [5, 10, 20]
+
+        try:
+            backtest_save_dir = None
+            if report_save_path is not None:
+                backtest_save_dir = report_save_path / "6_backtests"
+
+            summary_results = []
+            for holding_days in holding_days_list:
+                scenario = BacktestScenario(
+                    ticker=selections["ticker"],
+                    trade_date=selections["analysis_date"],
+                    asset_type=selections["asset_type"],
+                )
+                backtest_result = graph.run_backtest_from_final_states(
+                    [scenario],
+                    [final_state],
+                    holding_days=holding_days,
+                )
+                display_backtest_result(
+                    backtest_result,
+                    selections["ticker"],
+                    selections["analysis_date"],
+                    holding_days,
+                )
+                summary_results.append((holding_days, backtest_result))
+                if backtest_save_dir is not None:
+                    backtest_file = save_backtest_result_to_disk(
+                        backtest_result,
+                        selections["ticker"],
+                        selections["analysis_date"],
+                        holding_days,
+                        backtest_save_dir,
+                    )
+                    console.print(f"[green]✓ Backtest saved:[/green] {backtest_file.resolve()}")
+            display_backtest_summary(summary_results)
+            if backtest_save_dir is not None:
+                summary_file = save_backtest_summary_to_disk(
+                    summary_results,
+                    selections["ticker"],
+                    selections["analysis_date"],
+                    backtest_save_dir,
+                )
+                console.print(f"[green]✓ Backtest summary saved:[/green] {summary_file.resolve()}")
+                if report_file is not None:
+                    append_backtest_summary_to_report(report_file, summary_file)
+                    console.print(f"[green]✓ Appended backtest summary to:[/green] {report_file.resolve()}")
+        except Exception as e:
+            console.print(f"[red]Error running backtest: {e}[/red]")
 
     # Prompt to display full report
     display_choice = typer.prompt("\nDisplay full report on screen?", default="Y").strip().upper()

@@ -6,6 +6,7 @@ from tradingagents.agents.utils.agent_states import (
     InvestDebateState,
     RiskDebateState,
 )
+from tradingagents.core.time_context import TimeContext
 
 
 class Propagator:
@@ -14,6 +15,8 @@ class Propagator:
     def __init__(self, max_recur_limit=100):
         """Initialize with configuration parameters."""
         self.max_recur_limit = max_recur_limit
+        self.default_timezone = "America/New_York"
+        self.default_market_session = "close"
 
     def create_initial_state(
         self,
@@ -21,23 +24,20 @@ class Propagator:
         trade_date: str,
         asset_type: str = "stock",
         past_context: str = "",
-        instrument_context: str = "",
     ) -> Dict[str, Any]:
-        """Create the initial state for the agent graph.
-
-        ``instrument_context`` is the deterministic ticker-identity string
-        resolved once at run start (see
-        ``TradingAgentsGraph.resolve_instrument_context``). When empty, agents
-        fall back to ticker-only context via
-        ``get_instrument_context_from_state``.
-        """
+        """Create the initial state for the agent graph."""
         return {
             "messages": [("human", company_name)],
             "company_of_interest": company_name,
             "asset_type": asset_type,
-            "instrument_context": instrument_context,
             "trade_date": str(trade_date),
             "past_context": past_context,
+            "time_context": TimeContext.from_trade_date(
+                str(trade_date),
+                timezone_name=self.default_timezone,
+                market_session=self.default_market_session,
+            ).model_dump(),
+            "data_snapshot": {},
             "investment_debate_state": InvestDebateState(
                 {
                     "bull_history": "",
@@ -46,6 +46,11 @@ class Propagator:
                     "current_response": "",
                     "judge_decision": "",
                     "count": 0,
+                    "bull_signal": {},
+                    "bear_signal": {},
+                    "signal_summary": "",
+                    "signal_score": 0.0,
+                    "signal_confidence": 0.0,
                 }
             ),
             "risk_debate_state": RiskDebateState(
@@ -60,12 +65,25 @@ class Propagator:
                     "current_neutral_response": "",
                     "judge_decision": "",
                     "count": 0,
+                    "aggressive_signal": {},
+                    "conservative_signal": {},
+                    "neutral_signal": {},
+                    "signal_summary": "",
+                    "signal_score": 0.0,
+                    "signal_confidence": 0.0,
                 }
             ),
             "market_report": "",
+            "market_features": {},
             "fundamentals_report": "",
+            "fundamentals_features": {},
             "sentiment_report": "",
+            "sentiment_features": {},
             "news_report": "",
+            "news_features": {},
+            "factor_score": {},
+            "position_sizing": {},
+            "risk_gate_result": {},
         }
 
     def get_graph_args(self, callbacks: Optional[List] = None) -> Dict[str, Any]:

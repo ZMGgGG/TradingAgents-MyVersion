@@ -1,4 +1,6 @@
 from typing import Annotated
+import sys
+from requests import RequestException
 
 # Import from vendor-specific modules
 from .y_finance import (
@@ -22,8 +24,23 @@ from .alpha_vantage import (
     get_news as get_alpha_vantage_news,
     get_global_news as get_alpha_vantage_global_news,
 )
+from .akshare_cn import get_stock_data_cn, get_indicator_cn
+from .baostock_cn import (
+    get_stock_data_cn as get_stock_data_baostock_cn,
+    get_indicator_cn as get_indicator_baostock_cn,
+)
+from .akshare_news_cn import (
+    get_news_cn,
+    get_global_news_cn,
+    get_insider_transactions_cn,
+)
+from .akshare_fundamentals_cn import (
+    get_fundamentals_cn,
+    get_balance_sheet_cn,
+    get_cashflow_cn,
+    get_income_statement_cn,
+)
 from .alpha_vantage_common import AlphaVantageRateLimitError
-from .symbol_utils import NoMarketDataError
 
 # Configuration and routing logic
 from .config import get_config
@@ -64,6 +81,8 @@ TOOLS_CATEGORIES = {
 VENDOR_LIST = [
     "yfinance",
     "alpha_vantage",
+    "akshare_cn",
+    "baostock_cn",
 ]
 
 # Mapping of methods to their vendor-specific implementations
@@ -71,40 +90,51 @@ VENDOR_METHODS = {
     # core_stock_apis
     "get_stock_data": {
         "alpha_vantage": get_alpha_vantage_stock,
+        "akshare_cn": get_stock_data_cn,
+        "baostock_cn": get_stock_data_baostock_cn,
         "yfinance": get_YFin_data_online,
     },
     # technical_indicators
     "get_indicators": {
         "alpha_vantage": get_alpha_vantage_indicator,
+        "akshare_cn": get_indicator_cn,
+        "baostock_cn": get_indicator_baostock_cn,
         "yfinance": get_stock_stats_indicators_window,
     },
     # fundamental_data
     "get_fundamentals": {
+        "akshare_cn": get_fundamentals_cn,
         "alpha_vantage": get_alpha_vantage_fundamentals,
         "yfinance": get_yfinance_fundamentals,
     },
     "get_balance_sheet": {
+        "akshare_cn": get_balance_sheet_cn,
         "alpha_vantage": get_alpha_vantage_balance_sheet,
         "yfinance": get_yfinance_balance_sheet,
     },
     "get_cashflow": {
+        "akshare_cn": get_cashflow_cn,
         "alpha_vantage": get_alpha_vantage_cashflow,
         "yfinance": get_yfinance_cashflow,
     },
     "get_income_statement": {
+        "akshare_cn": get_income_statement_cn,
         "alpha_vantage": get_alpha_vantage_income_statement,
         "yfinance": get_yfinance_income_statement,
     },
     # news_data
     "get_news": {
+        "akshare_cn": get_news_cn,
         "alpha_vantage": get_alpha_vantage_news,
         "yfinance": get_news_yfinance,
     },
     "get_global_news": {
+        "akshare_cn": get_global_news_cn,
         "yfinance": get_global_news_yfinance,
         "alpha_vantage": get_alpha_vantage_global_news,
     },
     "get_insider_transactions": {
+        "akshare_cn": get_insider_transactions_cn,
         "alpha_vantage": get_alpha_vantage_insider_transactions,
         "yfinance": get_yfinance_insider_transactions,
     },
@@ -135,8 +165,9 @@ def get_vendor(category: str, method: str = None) -> str:
 def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation with fallback support."""
     category = get_category_for_method(method)
-    vendor_config = get_vendor(category, method)
+    vendor_config = _resolve_vendor_config(category, method, *args, **kwargs)
     primary_vendors = [v.strip() for v in vendor_config.split(',')]
+    symbol = _extract_symbol_arg(method, *args, **kwargs)
 
     if method not in VENDOR_METHODS:
         raise ValueError(f"Method '{method}' not supported")
@@ -148,49 +179,89 @@ def route_to_vendor(method: str, *args, **kwargs):
         if vendor not in fallback_vendors:
             fallback_vendors.append(vendor)
 
-    last_no_data: NoMarketDataError | None = None
-    first_error: Exception | None = None
     for vendor in fallback_vendors:
         if vendor not in VENDOR_METHODS[method]:
             continue
 
         vendor_impl = VENDOR_METHODS[method][vendor]
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
-
-        try:
-            return impl_func(*args, **kwargs)
-        except AlphaVantageRateLimitError:
-            continue  # Rate limits: try the next vendor
-        except NoMarketDataError as e:
-            last_no_data = e  # No data here; another vendor may have it
-            continue
-        except Exception as e:
-            # A fallback vendor failing for an incidental reason (e.g. no API
-            # key configured) must not crash the call when another vendor
-            # already determined the symbol simply has no data. Remember the
-            # first error so a genuine primary-vendor failure still surfaces.
-            if first_error is None:
-                first_error = e
-            continue
-
-    # If any vendor reported "no data", the symbol is genuinely unavailable.
-    # Return one explicit, instructive sentinel rather than a vendor-specific
-    # empty string, so the agent reports "unavailable" instead of inventing a
-    # value. This takes precedence over incidental fallback errors.
-    if last_no_data is not None:
-        sym = last_no_data.symbol
-        canonical = last_no_data.canonical
-        resolved = "" if canonical == sym else f" (resolved to '{canonical}')"
-        return (
-            f"NO_DATA_AVAILABLE: No market data found for '{sym}'{resolved} from "
-            f"any configured vendor. The symbol may be invalid, delisted, or not "
-            f"covered by Yahoo Finance / Alpha Vantage. Do not estimate or "
-            f"fabricate values — report that data is unavailable for this symbol."
+        _debug_vendor_trace(
+            f"[vendor] method={method} symbol={symbol or '-'} trying={vendor}"
         )
 
-    # No vendor returned data and none reported clean "no data" — surface the
-    # first real error (e.g. the primary vendor's network failure).
-    if first_error is not None:
-        raise first_error
+        try:
+            result = impl_func(*args, **kwargs)
+            _debug_vendor_trace(
+                f"[vendor] method={method} symbol={symbol or '-'} success={vendor}"
+            )
+            return result
+        except Exception as exc:
+            if _should_fallback(vendor, exc):
+                _debug_vendor_trace(
+                    f"[vendor] method={method} symbol={symbol or '-'} fallback_from={vendor} error={type(exc).__name__}: {exc}"
+                )
+                continue
+            raise
 
     raise RuntimeError(f"No available vendor for '{method}'")
+
+
+def _resolve_vendor_config(category: str, method: str, *args, **kwargs) -> str:
+    """Resolve the vendor chain for a specific tool call."""
+    explicit = get_vendor(category, method)
+    symbol = _extract_symbol_arg(method, *args, **kwargs)
+    if symbol and _is_cn_symbol(symbol) and method in {
+        "get_stock_data",
+        "get_indicators",
+        "get_fundamentals",
+        "get_balance_sheet",
+        "get_cashflow",
+        "get_income_statement",
+        "get_news",
+        "get_insider_transactions",
+    }:
+        if method in {"get_stock_data", "get_indicators"}:
+            return "akshare_cn,baostock_cn,yfinance"
+        return "akshare_cn,yfinance"
+    if method == "get_global_news" and _is_cn_symbol(symbol):
+        return "akshare_cn,yfinance"
+    return explicit
+
+
+def _extract_symbol_arg(method: str, *args, **kwargs) -> str:
+    """Extract the ticker-like symbol argument from a tool call."""
+    if "symbol" in kwargs:
+        return str(kwargs["symbol"])
+    if "ticker" in kwargs:
+        return str(kwargs["ticker"])
+    if not args:
+        return ""
+    if method in {"get_stock_data", "get_indicators"}:
+        return str(args[0])
+    if method in {"get_fundamentals", "get_balance_sheet", "get_cashflow", "get_income_statement", "get_news", "get_insider_transactions"}:
+        return str(args[0])
+    return ""
+
+
+def _is_cn_symbol(symbol: str) -> bool:
+    """Return True when a symbol looks like a mainland China A-share ticker."""
+    symbol_upper = str(symbol).upper()
+    return symbol_upper.endswith(".SS") or symbol_upper.endswith(".SZ")
+
+
+def _should_fallback(vendor: str, exc: Exception) -> bool:
+    """Return True when a vendor error should trigger fallback."""
+    if vendor == "alpha_vantage":
+        if isinstance(exc, AlphaVantageRateLimitError):
+            return True
+        if isinstance(exc, ValueError) and "ALPHA_VANTAGE_API_KEY" in str(exc):
+            return True
+        return False
+    if vendor == "akshare_cn":
+        return isinstance(exc, RequestException) or "Connection aborted" in str(exc)
+    return False
+
+
+def _debug_vendor_trace(message: str) -> None:
+    """Emit lightweight vendor trace lines during live runs."""
+    print(message, file=sys.stderr)
