@@ -6,6 +6,9 @@ from tradingagents.agents.schemas import (
 )
 from tradingagents.agents.utils.agent_utils import (
     build_compact_feature_context,
+    build_data_quality_context,
+    build_quant_summary_context,
+    build_report_evidence_pack,
     compact_history,
     get_language_instruction,
     get_time_context_instruction,
@@ -30,11 +33,13 @@ def create_aggressive_debator(llm):
         current_neutral_response = risk_debate_state.get("current_neutral_response", "")
 
         first_round = risk_debate_state.get("count", 0) == 0
-        market_research_report = state["market_report"] if first_round else "[Use structured feature summary below; full market report omitted after round 1.]"
-        sentiment_report = state["sentiment_report"] if first_round else "[Use structured feature summary below; full sentiment report omitted after round 1.]"
-        news_report = state["news_report"] if first_round else "[Use structured feature summary below; full news report omitted after round 1.]"
-        fundamentals_report = state["fundamentals_report"] if first_round else "[Use structured feature summary below; full fundamentals report omitted after round 1.]"
+        market_research_report = build_report_evidence_pack(state, report_key="market_report", features_key="market_features", label="Market") if first_round else "[Use structured feature summary below; full market report omitted after round 1.]"
+        sentiment_report = build_report_evidence_pack(state, report_key="sentiment_report", features_key="sentiment_features", label="Sentiment") if first_round else "[Use structured feature summary below; full sentiment report omitted after round 1.]"
+        news_report = build_report_evidence_pack(state, report_key="news_report", features_key="news_features", label="News") if first_round else "[Use structured feature summary below; full news report omitted after round 1.]"
+        fundamentals_report = build_report_evidence_pack(state, report_key="fundamentals_report", features_key="fundamentals_features", label="Fundamentals") if first_round else "[Use structured feature summary below; full fundamentals report omitted after round 1.]"
         feature_context = build_compact_feature_context(state)
+        data_quality_context = build_data_quality_context(state)
+        quant_context = build_quant_summary_context(state)
 
         trader_decision = state["trader_investment_plan"]
 
@@ -45,6 +50,8 @@ def create_aggressive_debator(llm):
 Your task is to create a compelling case for the trader's decision by questioning and critiquing the conservative and neutral stances to demonstrate why your high-reward perspective offers the best path forward. Incorporate insights from the following sources into your arguments:
 
 {feature_context}
+{data_quality_context}
+{quant_context}
 
 Market Research Report: {market_research_report}
 Social Media Sentiment Report: {sentiment_report}
@@ -53,6 +60,8 @@ Company Fundamentals Report: {fundamentals_report}
 Here is the current conversation history: {compact_risk_history} Here are the last arguments from the conservative analyst: {current_conservative_response} Here are the last arguments from the neutral analyst: {current_neutral_response}. If there are no responses from the other viewpoints yet, present your own argument based on the available data.
 
 Engage actively by addressing any specific concerns raised, refuting the weaknesses in their logic, and asserting the benefits of risk-taking to outpace market norms. Maintain a focus on debating and persuading, not just presenting data. Challenge each counterpoint to underscore why a high-risk approach is optimal.
+Avoid repeating points already covered in the history unless you are adding a new number, a new scenario, or a stronger rebuttal.
+Keep the debate body concise: no more than 4 short paragraphs or bullets, under 900 Chinese characters or 450 English words. Do not restate full analyst reports; cite only the strongest evidence.
 First write your normal debate response in natural language. Then append a machine-readable summary block in exactly this format:
 
 STRUCTURED_SUMMARY
@@ -65,7 +74,7 @@ THESIS: <one concise thesis>
 GUARDRAILS: <risk guardrails or risk-taking conditions>
 END_STRUCTURED_SUMMARY
 
-Keep the debate body rich and persuasive. The summary block should be brief and only appear once at the end.
+Keep the summary block brief and only appear once at the end.
 {get_time_context_instruction(state)}""" + get_language_instruction()
 
         rendered_signal, signal = invoke_structured_or_freetext_result(

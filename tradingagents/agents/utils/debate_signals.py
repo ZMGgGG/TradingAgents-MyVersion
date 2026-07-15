@@ -70,9 +70,9 @@ def summarize_investment_signals(
 
     net_score = sum(weighted_scores) / len(weighted_scores)
     average_confidence = sum(s.confidence for s in signals) / len(signals)
-    if net_score >= 0.2:
+    if net_score >= 0.1:
         recommendation = "Buy"
-    elif net_score <= -0.2:
+    elif net_score <= -0.1:
         recommendation = "Sell"
     else:
         recommendation = "Hold"
@@ -116,9 +116,9 @@ def summarize_risk_signals(
     ]
     net_score = sum(weighted_scores) / len(weighted_scores)
     average_confidence = sum(s.confidence for s in signals) / len(signals)
-    if net_score >= 0.2:
+    if net_score >= 0.1:
         posture = "Aggressive"
-    elif net_score <= -0.2:
+    elif net_score <= -0.1:
         posture = "Conservative"
     else:
         posture = "Balanced"

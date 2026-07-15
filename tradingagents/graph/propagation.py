@@ -24,6 +24,7 @@ class Propagator:
         trade_date: str,
         asset_type: str = "stock",
         past_context: str = "",
+        analysis_lookback_days: int = 30,
     ) -> Dict[str, Any]:
         """Create the initial state for the agent graph."""
         return {
@@ -36,6 +37,7 @@ class Propagator:
                 str(trade_date),
                 timezone_name=self.default_timezone,
                 market_session=self.default_market_session,
+                analysis_lookback_days=analysis_lookback_days,
             ).model_dump(),
             "data_snapshot": {},
             "investment_debate_state": InvestDebateState(
@@ -75,15 +77,22 @@ class Propagator:
             ),
             "market_report": "",
             "market_features": {},
+            "market_evidence_ledger": {},
             "fundamentals_report": "",
             "fundamentals_features": {},
             "sentiment_report": "",
             "sentiment_features": {},
+            "sentiment_evidence_ledger": {},
             "news_report": "",
             "news_features": {},
+            "news_evidence_ledger": {},
+            "alpha_mining_result": {},
+            "alpha_experience_summary": {},
+            "fundamentals_evidence_ledger": {},
             "factor_score": {},
             "position_sizing": {},
             "risk_gate_result": {},
+            "execution_plan": {},
         }
 
     def get_graph_args(self, callbacks: Optional[List] = None) -> Dict[str, Any]:

@@ -165,6 +165,38 @@ def select_research_depth() -> int:
     return choice
 
 
+def select_analysis_lookback_days() -> int:
+    """Select one shared lookback window for market, news, and sentiment analysis."""
+    choice = questionary.select(
+        "Select Shared Analysis Lookback Window:",
+        choices=[
+            questionary.Choice("7 days", 7),
+            questionary.Choice("14 days", 14),
+            questionary.Choice("30 days (default)", 30),
+            questionary.Choice("60 days", 60),
+            questionary.Choice("90 days", 90),
+            questionary.Choice("Custom days", "custom"),
+        ],
+        instruction="\n- This one window will be reused by market, news, and sentiment analysis\n- Use arrow keys to navigate\n- Press Enter to select",
+        style=questionary.Style(
+            [
+                ("selected", "fg:yellow noinherit"),
+                ("highlighted", "fg:yellow noinherit"),
+                ("pointer", "fg:yellow noinherit"),
+            ]
+        ),
+    ).ask()
+
+    if choice == "custom":
+        raw = questionary.text(
+            "Enter shared analysis lookback days:",
+            validate=lambda x: x.strip().isdigit() and int(x.strip()) > 0 or "Please enter a positive integer.",
+        ).ask()
+        return int(raw.strip())
+
+    return int(choice or 30)
+
+
 def _fetch_openrouter_models() -> List[Tuple[str, str]]:
     """Fetch available models from the OpenRouter API."""
     import requests

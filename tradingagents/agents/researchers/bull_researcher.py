@@ -6,6 +6,9 @@ from tradingagents.agents.schemas import (
 )
 from tradingagents.agents.utils.agent_utils import (
     build_compact_feature_context,
+    build_data_quality_context,
+    build_quant_summary_context,
+    build_report_evidence_pack,
     compact_history,
     get_language_instruction,
     get_time_context_instruction,
@@ -31,11 +34,13 @@ def create_bull_researcher(llm):
 
         current_response = investment_debate_state.get("current_response", "")
         feature_context = build_compact_feature_context(state)
+        data_quality_context = build_data_quality_context(state)
+        quant_context = build_quant_summary_context(state)
         first_round = investment_debate_state.get("count", 0) == 0
-        market_research_report = state["market_report"] if first_round else "[Use structured feature summary below; full market report omitted after round 1.]"
-        sentiment_report = state["sentiment_report"] if first_round else "[Use structured feature summary below; full sentiment report omitted after round 1.]"
-        news_report = state["news_report"] if first_round else "[Use structured feature summary below; full news report omitted after round 1.]"
-        fundamentals_report = state["fundamentals_report"] if first_round else "[Use structured feature summary below; full fundamentals report omitted after round 1.]"
+        market_research_report = build_report_evidence_pack(state, report_key="market_report", features_key="market_features", label="Market") if first_round else "[Use structured feature summary below; full market report omitted after round 1.]"
+        sentiment_report = build_report_evidence_pack(state, report_key="sentiment_report", features_key="sentiment_features", label="Sentiment") if first_round else "[Use structured feature summary below; full sentiment report omitted after round 1.]"
+        news_report = build_report_evidence_pack(state, report_key="news_report", features_key="news_features", label="News") if first_round else "[Use structured feature summary below; full news report omitted after round 1.]"
+        fundamentals_report = build_report_evidence_pack(state, report_key="fundamentals_report", features_key="fundamentals_features", label="Fundamentals") if first_round else "[Use structured feature summary below; full fundamentals report omitted after round 1.]"
         asset_type = state.get("asset_type", "stock")
         target_label = "stock" if asset_type == "stock" else "asset"
         fundamentals_label = (
@@ -56,6 +61,8 @@ Key points to focus on:
 Resources available:
 Structured analyst feature summary:
 {feature_context}
+{data_quality_context}
+{quant_context}
 Market research report: {market_research_report}
 Social media sentiment report: {sentiment_report}
 Latest world affairs news: {news_report}
@@ -63,6 +70,8 @@ Latest world affairs news: {news_report}
 Conversation history of the debate: {compact_debate_history}
 Last bear argument: {current_response}
 Use this information to deliver a compelling bull argument, refute the bear's concerns, and engage in a dynamic debate that demonstrates the strengths of the bull position.
+Avoid repeating the same thesis in multiple phrasings. Add at least one quantified or scenario-based argument when possible (for example: what happens if the current factor composite persists, or if sentiment/data quality improves).
+Keep the debate body concise: no more than 4 short paragraphs or bullets, under 900 Chinese characters or 450 English words. Do not restate full analyst reports; cite only the strongest evidence.
 First write your normal debate response in natural language. Then append a machine-readable summary block in exactly this format:
 
 STRUCTURED_SUMMARY
@@ -76,7 +85,7 @@ REBUTTAL: <main rebuttal to the bear case>
 KEY_RISKS: <main risks to the bull case>
 END_STRUCTURED_SUMMARY
 
-Keep the debate body rich and persuasive. The summary block should be brief and only appear once at the end.
+Keep the summary block brief and only appear once at the end.
 {get_time_context_instruction(state)}""" + get_language_instruction()
 
         rendered_signal, signal = invoke_structured_or_freetext_result(

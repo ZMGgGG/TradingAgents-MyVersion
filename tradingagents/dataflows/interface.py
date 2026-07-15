@@ -41,6 +41,7 @@ from .akshare_fundamentals_cn import (
     get_income_statement_cn,
 )
 from .alpha_vantage_common import AlphaVantageRateLimitError
+from tradingagents.core.run_metrics import record_vendor_metric
 
 # Configuration and routing logic
 from .config import get_config
@@ -185,24 +186,39 @@ def route_to_vendor(method: str, *args, **kwargs):
 
         vendor_impl = VENDOR_METHODS[method][vendor]
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
+        record_vendor_metric("attempt", method, vendor)
         _debug_vendor_trace(
-            f"[vendor] method={method} symbol={symbol or '-'} trying={vendor}"
+            f"[vendor] method={method} symbol={symbol or '-'} trying={vendor}",
+            level="debug",
         )
 
         try:
             result = impl_func(*args, **kwargs)
+            if _should_fallback_on_result(vendor, result):
+                record_vendor_metric("fallback", method, vendor)
+                _debug_vendor_trace(
+                    f"[vendor] method={method} symbol={symbol or '-'} fallback_from={vendor} result=empty_or_unavailable",
+                    level="summary",
+                )
+                continue
+            record_vendor_metric("success", method, vendor)
             _debug_vendor_trace(
-                f"[vendor] method={method} symbol={symbol or '-'} success={vendor}"
+                f"[vendor] method={method} symbol={symbol or '-'} success={vendor}",
+                level="debug",
             )
             return result
         except Exception as exc:
             if _should_fallback(vendor, exc):
+                record_vendor_metric("fallback", method, vendor)
                 _debug_vendor_trace(
-                    f"[vendor] method={method} symbol={symbol or '-'} fallback_from={vendor} error={type(exc).__name__}: {exc}"
+                    f"[vendor] method={method} symbol={symbol or '-'} fallback_from={vendor} error={type(exc).__name__}: {exc}",
+                    level="summary",
                 )
                 continue
+            record_vendor_metric("failure", method, vendor)
             raise
 
+    record_vendor_metric("failure", method, "all")
     raise RuntimeError(f"No available vendor for '{method}'")
 
 
@@ -251,17 +267,51 @@ def _is_cn_symbol(symbol: str) -> bool:
 
 def _should_fallback(vendor: str, exc: Exception) -> bool:
     """Return True when a vendor error should trigger fallback."""
+    message = str(exc)
     if vendor == "alpha_vantage":
         if isinstance(exc, AlphaVantageRateLimitError):
             return True
-        if isinstance(exc, ValueError) and "ALPHA_VANTAGE_API_KEY" in str(exc):
+        if isinstance(exc, ValueError) and "ALPHA_VANTAGE_API_KEY" in message:
             return True
         return False
     if vendor == "akshare_cn":
-        return isinstance(exc, RequestException) or "Connection aborted" in str(exc)
+        return (
+            isinstance(exc, RequestException)
+            or "Connection aborted" in message
+            or "only supports .SS/.SZ tickers" in message
+        )
+    if vendor == "baostock_cn":
+        return "only supports .SS/.SZ tickers" in message
     return False
 
 
-def _debug_vendor_trace(message: str) -> None:
-    """Emit lightweight vendor trace lines during live runs."""
-    print(message, file=sys.stderr)
+def _debug_vendor_trace(message: str, level: str = "debug") -> None:
+    """Emit vendor trace lines according to the configured verbosity."""
+    trace_level = str(get_config().get("vendor_trace_level", "summary")).strip().lower()
+    if trace_level == "debug":
+        print(message, file=sys.stderr)
+        return
+    if trace_level == "summary" and level != "debug":
+        print(message, file=sys.stderr)
+
+
+def _should_fallback_on_result(vendor: str, result: object) -> bool:
+    """Treat vendor placeholder strings as soft failures so fallback can continue."""
+    if not isinstance(result, str):
+        return False
+    normalized = result.strip().lower()
+    soft_markers = (
+        "no data found",
+        "data unavailable",
+        "rate limited",
+        "unavailable",
+        "no fundamentals data found",
+        "no balance sheet data found",
+        "no cash flow data found",
+        "no income statement data found",
+        "no insider transactions data found",
+        "<stocktwits unavailable",
+        "<cn retail sentiment proxy unavailable>",
+        "<cn forum / attention proxy unavailable>",
+    )
+    return any(marker in normalized for marker in soft_markers)

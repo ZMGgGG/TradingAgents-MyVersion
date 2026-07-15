@@ -3,6 +3,14 @@ from typing import Annotated
 from tradingagents.dataflows.interface import route_to_vendor
 
 
+def _safe_statement_result(label: str, ticker: str, error: Exception) -> str:
+    return (
+        f"{label} data unavailable for {ticker}. "
+        f"The fundamentals analyst should continue with the comprehensive fundamentals summary and other available evidence. "
+        f"Reason: {error}"
+    )
+
+
 @tool
 def get_fundamentals(
     ticker: Annotated[str, "ticker symbol"],
@@ -17,7 +25,10 @@ def get_fundamentals(
     Returns:
         str: A formatted report containing comprehensive fundamental data
     """
-    return route_to_vendor("get_fundamentals", ticker, curr_date)
+    try:
+        return route_to_vendor("get_fundamentals", ticker, curr_date)
+    except Exception as error:
+        return _safe_statement_result("Fundamentals", ticker, error)
 
 
 @tool
@@ -36,7 +47,10 @@ def get_balance_sheet(
     Returns:
         str: A formatted report containing balance sheet data
     """
-    return route_to_vendor("get_balance_sheet", ticker, freq, curr_date)
+    try:
+        return route_to_vendor("get_balance_sheet", ticker, freq, curr_date)
+    except Exception as error:
+        return _safe_statement_result("Balance sheet", ticker, error)
 
 
 @tool
@@ -55,7 +69,10 @@ def get_cashflow(
     Returns:
         str: A formatted report containing cash flow statement data
     """
-    return route_to_vendor("get_cashflow", ticker, freq, curr_date)
+    try:
+        return route_to_vendor("get_cashflow", ticker, freq, curr_date)
+    except Exception as error:
+        return _safe_statement_result("Cash flow", ticker, error)
 
 
 @tool
@@ -74,4 +91,7 @@ def get_income_statement(
     Returns:
         str: A formatted report containing income statement data
     """
-    return route_to_vendor("get_income_statement", ticker, freq, curr_date)
+    try:
+        return route_to_vendor("get_income_statement", ticker, freq, curr_date)
+    except Exception as error:
+        return _safe_statement_result("Income statement", ticker, error)

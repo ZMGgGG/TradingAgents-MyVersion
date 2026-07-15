@@ -21,6 +21,11 @@ def test_batch_backtester_runs_from_final_states_without_propagate():
             {
                 "final_trade_decision": "**Rating**: Buy",
                 "investment_debate_state": {"signal_confidence": 0.8},
+                "execution_plan": {
+                    "action": "buy",
+                    "target_position_size": 0.05,
+                    "risk_gate_approved": True,
+                },
             }
         ],
         holding_days=5,
@@ -29,6 +34,8 @@ def test_batch_backtester_runs_from_final_states_without_propagate():
     graph.propagate.assert_not_called()
     assert len(result.trades) == 1
     assert result.trades[0].rating == "Buy"
+    assert result.trades[0].executed_return == pytest.approx(0.05 * 0.05)
+    assert result.trades[0].ending_capital == pytest.approx(1.0 * (1.0 + 0.05 * 0.05))
     assert result.metrics.trade_count == 1
 
 
@@ -57,16 +64,15 @@ def test_fetch_returns_falls_back_when_benchmark_missing(monkeypatch):
                 return self._close
             raise KeyError(key)
 
-    class _Ticker:
-        def __init__(self, symbol):
-            self.symbol = symbol
+    def _load_history(self, symbol, start_date, end_date):
+        if symbol == "MISSING_BENCH":
+            return _History([100.0])
+        return _History([100.0, 105.0, 106.0])
 
-        def history(self, start=None, end=None):
-            if self.symbol == "MISSING_BENCH":
-                return _History([100.0])
-            return _History([100.0, 105.0, 106.0])
-
-    monkeypatch.setattr("tradingagents.graph.trading_graph.yf.Ticker", _Ticker)
+    monkeypatch.setattr(
+        "tradingagents.graph.trading_graph.TradingAgentsGraph._load_price_history_for_returns",
+        _load_history,
+    )
 
     graph = TradingAgentsGraph.__new__(TradingAgentsGraph)
     raw, alpha, days = TradingAgentsGraph._fetch_returns(
@@ -119,3 +125,85 @@ def test_fetch_returns_uses_vendor_price_payload(monkeypatch):
     assert raw is not None
     assert alpha is not None
     assert days == 2
+
+
+@pytest.mark.unit
+def test_execution_plan_hold_produces_zero_return():
+    graph = MagicMock()
+    graph._resolve_benchmark.return_value = "SPY"
+    graph._fetch_returns.return_value = (0.05, 0.02, 5)
+
+    backtester = BatchBacktester(graph)
+    result = backtester.run_from_final_states(
+        [BacktestScenario(ticker="NVDA", trade_date="2026-05-01")],
+        [
+            {
+                "final_trade_decision": "**Rating**: Hold",
+                "investment_debate_state": {"signal_confidence": 0.8},
+                "execution_plan": {
+                    "action": "hold",
+                    "target_position_size": 0.0,
+                    "risk_gate_approved": True,
+                },
+            }
+        ],
+        holding_days=5,
+    )
+
+    assert result.trades[0].executed_return == 0.0
+    assert result.trades[0].executed_alpha_return == 0.0
+
+
+@pytest.mark.unit
+def test_execution_plan_hold_with_residual_position_keeps_exposure():
+    graph = MagicMock()
+    graph._resolve_benchmark.return_value = "SPY"
+    graph._fetch_returns.return_value = (0.05, 0.02, 5)
+
+    backtester = BatchBacktester(graph)
+    result = backtester.run_from_final_states(
+        [BacktestScenario(ticker="NVDA", trade_date="2026-05-01")],
+        [
+            {
+                "final_trade_decision": "**Rating**: Hold",
+                "investment_debate_state": {"signal_confidence": 0.8},
+                "execution_plan": {
+                    "action": "hold",
+                    "target_position_size": 0.05,
+                    "risk_gate_approved": True,
+                },
+            }
+        ],
+        holding_days=5,
+    )
+
+    assert result.trades[0].executed_return == pytest.approx(0.05 * 0.05)
+    assert result.trades[0].executed_alpha_return == pytest.approx(0.02 * 0.05)
+
+
+@pytest.mark.unit
+def test_execution_plan_uses_custom_initial_capital():
+    graph = MagicMock()
+    graph._resolve_benchmark.return_value = "SPY"
+    graph._fetch_returns.return_value = (0.10, 0.04, 5)
+
+    backtester = BatchBacktester(graph)
+    result = backtester.run_from_final_states(
+        [BacktestScenario(ticker="NVDA", trade_date="2026-05-01")],
+        [
+            {
+                "final_trade_decision": "**Rating**: Buy",
+                "investment_debate_state": {"signal_confidence": 0.8},
+                "execution_plan": {
+                    "action": "buy",
+                    "target_position_size": 0.10,
+                    "risk_gate_approved": True,
+                },
+            }
+        ],
+        holding_days=5,
+        initial_capital=100000.0,
+    )
+
+    assert result.trades[0].initial_capital == 100000.0
+    assert result.trades[0].ending_capital == pytest.approx(101000.0)

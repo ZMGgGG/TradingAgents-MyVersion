@@ -1,5 +1,6 @@
 from typing import Optional
 import datetime
+import json
 import typer
 import questionary
 from pathlib import Path
@@ -27,12 +28,57 @@ from tradingagents.graph.analyst_execution import (
     get_initial_analyst_node,
     sync_analyst_tracker_from_chunk,
 )
+from tradingagents.core.data_snapshot import DataSnapshot
+from tradingagents.alpha_mining import (
+    AlphaEvaluator,
+    AlphaMiningEpisode,
+    AlphaMiningHistory,
+    AlphaRegistry,
+    AlphaRegistryEntry,
+    QuantaAlphaMiner,
+    AlphaCandidate,
+    alpha_text,
+    build_alpha_experience_summary,
+    generate_crossover_set,
+    generate_mutation_set,
+)
 from tradingagents.backtesting import BacktestScenario
+from tradingagents.backtesting.engine import BatchBacktester
+from tradingagents.decisioning.execution_policy import candidate_signal_to_execution
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.evaluation import (
+    ReportEvaluator,
+    extract_reference_text_from_html_file,
+    extract_reference_text_from_pdf_file,
+    render_report_evaluation,
+)
+from tradingagents.graph.checkpointer import clear_all_checkpoints
+from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.dataflows.interface import route_to_vendor
 from cli.models import AnalystType
 from cli.utils import *
 from cli.announcements import fetch_announcements, display_announcements
 from cli.stats_handler import StatsCallbackHandler
+from cli.report_io import (
+    append_backtest_summary_to_report,
+    append_report_evaluation_to_report,
+    save_report_to_disk,
+)
+from cli.report_helpers import build_evidence_ledger_sections, build_structured_summary_status
+from cli.alpha_flow import (
+    choose_alpha_source,
+    discover_alpha_sources,
+    print_alpha_mining_success,
+    run_alpha_mining_for_source,
+)
+from cli.backtest_flow import (
+    display_backtest_result,
+    display_backtest_summary,
+    parse_holding_days_input,
+    parse_initial_capital_input,
+    save_backtest_result_to_disk,
+    save_backtest_summary_to_disk,
+)
 
 console = Console()
 
@@ -41,6 +87,30 @@ app = typer.Typer(
     help="TradingAgents CLI: Multi-Agents LLM Financial Trading Framework",
     add_completion=True,  # Enable shell completion
 )
+
+
+@app.callback(invoke_without_command=True)
+def main_callback(
+    ctx: typer.Context,
+    checkpoint: bool = typer.Option(
+        False,
+        "--checkpoint",
+        help="Enable checkpoint/resume: save state after each node so a crashed run can resume.",
+    ),
+    clear_checkpoints: bool = typer.Option(
+        False,
+        "--clear-checkpoints",
+        help="Delete all saved checkpoints before running (force fresh start).",
+    ),
+):
+    """Default to analysis when no explicit subcommand is provided."""
+    if ctx.invoked_subcommand is not None:
+        return
+    if clear_checkpoints:
+        from tradingagents.graph.checkpointer import clear_all_checkpoints
+        n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
+        console.print(f"[yellow]Cleared {n} checkpoint(s).[/yellow]")
+    run_analysis(checkpoint=checkpoint)
 
 
 # Create a deque to store recent messages with a maximum length
@@ -527,19 +597,29 @@ def get_user_selections():
     )
     analysis_date = get_analysis_date()
 
-    # Step 3: Output language
+    # Step 3: Shared analysis lookback window
     console.print(
         create_question_box(
-            "Step 3: Output Language",
+            "Step 3: Shared Lookback Window",
+            "Select one lookback window to reuse across market, news, and sentiment analysis",
+            "30 days",
+        )
+    )
+    analysis_lookback_days = select_analysis_lookback_days()
+
+    # Step 4: Output language
+    console.print(
+        create_question_box(
+            "Step 4: Output Language",
             "Select the language for analyst reports and final decision"
         )
     )
     output_language = ask_output_language()
 
-    # Step 4: Select analysts
+    # Step 5: Select analysts
     console.print(
         create_question_box(
-            "Step 4: Analysts Team", "Select your LLM analyst agents for the analysis"
+            "Step 5: Analysts Team", "Select your LLM analyst agents for the analysis"
         )
     )
     selected_analysts = select_analysts(asset_type)
@@ -547,18 +627,18 @@ def get_user_selections():
         f"[green]Selected analysts:[/green] {', '.join(analyst.value for analyst in selected_analysts)}"
     )
 
-    # Step 5: Research depth
+    # Step 6: Research depth
     console.print(
         create_question_box(
-            "Step 5: Research Depth", "Select your research depth level"
+            "Step 6: Research Depth", "Select your research depth level"
         )
     )
     selected_research_depth = select_research_depth()
 
-    # Step 6: LLM Provider
+    # Step 7: LLM Provider
     console.print(
         create_question_box(
-            "Step 6: LLM Provider", "Select your LLM provider"
+            "Step 7: LLM Provider", "Select your LLM provider"
         )
     )
     selected_llm_provider, backend_url = select_llm_provider()
@@ -583,16 +663,16 @@ def get_user_selections():
     # doesn't fail later at the first API call.
     ensure_api_key(selected_llm_provider)
 
-    # Step 7: Thinking agents
+    # Step 8: Thinking agents
     console.print(
         create_question_box(
-            "Step 7: Thinking Agents", "Select your thinking agents for analysis"
+            "Step 8: Thinking Agents", "Select your thinking agents for analysis"
         )
     )
     selected_shallow_thinker = select_shallow_thinking_agent(selected_llm_provider)
     selected_deep_thinker = select_deep_thinking_agent(selected_llm_provider)
 
-    # Step 8: Provider-specific thinking configuration
+    # Step 9: Provider-specific thinking configuration
     thinking_level = None
     reasoning_effort = None
     anthropic_effort = None
@@ -601,7 +681,7 @@ def get_user_selections():
     if provider_lower == "google":
         console.print(
             create_question_box(
-                "Step 8: Thinking Mode",
+                "Step 9: Thinking Mode",
                 "Configure Gemini thinking mode"
             )
         )
@@ -609,7 +689,7 @@ def get_user_selections():
     elif provider_lower == "openai":
         console.print(
             create_question_box(
-                "Step 8: Reasoning Effort",
+                "Step 9: Reasoning Effort",
                 "Configure OpenAI reasoning effort level"
             )
         )
@@ -617,7 +697,7 @@ def get_user_selections():
     elif provider_lower == "anthropic":
         console.print(
             create_question_box(
-                "Step 8: Effort Level",
+                "Step 9: Effort Level",
                 "Configure Claude effort level"
             )
         )
@@ -627,6 +707,7 @@ def get_user_selections():
         "ticker": selected_ticker,
         "asset_type": asset_type.value,
         "analysis_date": analysis_date,
+        "analysis_lookback_days": analysis_lookback_days,
         "analysts": selected_analysts,
         "research_depth": selected_research_depth,
         "llm_provider": selected_llm_provider.lower(),
@@ -682,136 +763,102 @@ def get_analysis_date():
             )
 
 
-def _summary_block_status(text: str) -> str:
-    if not text or not isinstance(text, str):
-        return "missing"
-    if "STRUCTURED_SUMMARY" in text and "END_STRUCTURED_SUMMARY" in text:
-        return "present"
-    return "absent"
+def display_report_evaluation(evaluation):
+    """Display report quality evaluation against a reference answer."""
+    console.print()
+    console.print(Rule("Research Report Evaluation", style="bold cyan"))
 
+    score_table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
+    score_table.add_column("Dimension", style="cyan")
+    score_table.add_column("Score", style="green")
+    score_table.add_row("Factual Coverage", f"{evaluation.factual_coverage:.1f}/10")
+    score_table.add_row("Evidence Support", f"{evaluation.evidence_support:.1f}/10")
+    score_table.add_row("Reasoning Consistency", f"{evaluation.reasoning_consistency:.1f}/10")
+    score_table.add_row("Risk Awareness", f"{evaluation.risk_awareness:.1f}/10")
+    score_table.add_row("Actionability", f"{evaluation.actionability:.1f}/10")
+    score_table.add_row("Writing Quality", f"{evaluation.writing_quality:.1f}/10")
+    score_table.add_row("Total", f"{evaluation.total_score:.1f}/100")
+    console.print(Panel(score_table, title="Scorecard", border_style="cyan"))
 
-def build_structured_summary_status(final_state) -> list[tuple[str, str]]:
-    statuses = []
-
-    debate = final_state.get("investment_debate_state", {})
-    risk = final_state.get("risk_debate_state", {})
-
-    statuses.append(("Bull Researcher", _summary_block_status(debate.get("bull_history", ""))))
-    statuses.append(("Bear Researcher", _summary_block_status(debate.get("bear_history", ""))))
-    statuses.append(("Research Manager", _summary_block_status(debate.get("judge_decision", ""))))
-    statuses.append(("Trader", _summary_block_status(final_state.get("trader_investment_plan", ""))))
-    statuses.append(("Aggressive Analyst", _summary_block_status(risk.get("aggressive_history", ""))))
-    statuses.append(("Conservative Analyst", _summary_block_status(risk.get("conservative_history", ""))))
-    statuses.append(("Neutral Analyst", _summary_block_status(risk.get("neutral_history", ""))))
-    statuses.append(("Portfolio Manager", _summary_block_status(risk.get("judge_decision", ""))))
-
-    return statuses
-
-
-def save_report_to_disk(final_state, ticker: str, save_path: Path):
-    """Save complete analysis report to disk with organized subfolders."""
-    save_path.mkdir(parents=True, exist_ok=True)
-    sections = []
-
-    # 1. Analysts
-    analysts_dir = save_path / "1_analysts"
-    analyst_parts = []
-    if final_state.get("market_report"):
-        analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "market.md").write_text(final_state["market_report"], encoding="utf-8")
-        analyst_parts.append(("Market Analyst", final_state["market_report"]))
-    if final_state.get("sentiment_report"):
-        analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "sentiment.md").write_text(final_state["sentiment_report"], encoding="utf-8")
-        analyst_parts.append(("Sentiment Analyst", final_state["sentiment_report"]))
-    if final_state.get("news_report"):
-        analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "news.md").write_text(final_state["news_report"], encoding="utf-8")
-        analyst_parts.append(("News Analyst", final_state["news_report"]))
-    if final_state.get("fundamentals_report"):
-        analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "fundamentals.md").write_text(final_state["fundamentals_report"], encoding="utf-8")
-        analyst_parts.append(("Fundamentals Analyst", final_state["fundamentals_report"]))
-    if analyst_parts:
-        content = "\n\n".join(f"### {name}\n{text}" for name, text in analyst_parts)
-        sections.append(f"## I. Analyst Team Reports\n\n{content}")
-
-    # 2. Research
-    if final_state.get("investment_debate_state"):
-        research_dir = save_path / "2_research"
-        debate = final_state["investment_debate_state"]
-        research_parts = []
-        if debate.get("bull_history"):
-            research_dir.mkdir(exist_ok=True)
-            (research_dir / "bull.md").write_text(debate["bull_history"], encoding="utf-8")
-            research_parts.append(("Bull Researcher", debate["bull_history"]))
-        if debate.get("bear_history"):
-            research_dir.mkdir(exist_ok=True)
-            (research_dir / "bear.md").write_text(debate["bear_history"], encoding="utf-8")
-            research_parts.append(("Bear Researcher", debate["bear_history"]))
-        if debate.get("judge_decision"):
-            research_dir.mkdir(exist_ok=True)
-            (research_dir / "manager.md").write_text(debate["judge_decision"], encoding="utf-8")
-            research_parts.append(("Research Manager", debate["judge_decision"]))
-        if research_parts:
-            content = "\n\n".join(f"### {name}\n{text}" for name, text in research_parts)
-            sections.append(f"## II. Research Team Decision\n\n{content}")
-
-    # 3. Trading
-    if final_state.get("trader_investment_plan"):
-        trading_dir = save_path / "3_trading"
-        trading_dir.mkdir(exist_ok=True)
-        (trading_dir / "trader.md").write_text(final_state["trader_investment_plan"], encoding="utf-8")
-        sections.append(f"## III. Trading Team Plan\n\n### Trader\n{final_state['trader_investment_plan']}")
-
-    # 4. Risk Management
-    if final_state.get("risk_debate_state"):
-        risk_dir = save_path / "4_risk"
-        risk = final_state["risk_debate_state"]
-        risk_parts = []
-        if risk.get("aggressive_history"):
-            risk_dir.mkdir(exist_ok=True)
-            (risk_dir / "aggressive.md").write_text(risk["aggressive_history"], encoding="utf-8")
-            risk_parts.append(("Aggressive Analyst", risk["aggressive_history"]))
-        if risk.get("conservative_history"):
-            risk_dir.mkdir(exist_ok=True)
-            (risk_dir / "conservative.md").write_text(risk["conservative_history"], encoding="utf-8")
-            risk_parts.append(("Conservative Analyst", risk["conservative_history"]))
-        if risk.get("neutral_history"):
-            risk_dir.mkdir(exist_ok=True)
-            (risk_dir / "neutral.md").write_text(risk["neutral_history"], encoding="utf-8")
-            risk_parts.append(("Neutral Analyst", risk["neutral_history"]))
-        if risk_parts:
-            content = "\n\n".join(f"### {name}\n{text}" for name, text in risk_parts)
-            sections.append(f"## IV. Risk Management Team Decision\n\n{content}")
-
-        # 5. Portfolio Manager
-        if risk.get("judge_decision"):
-            portfolio_dir = save_path / "5_portfolio"
-            portfolio_dir.mkdir(exist_ok=True)
-            (portfolio_dir / "decision.md").write_text(risk["judge_decision"], encoding="utf-8")
-            sections.append(f"## V. Portfolio Manager Decision\n\n### Portfolio Manager\n{risk['judge_decision']}")
-
-    # Write consolidated report
-    header = f"# Trading Analysis Report: {ticker}\n\nGenerated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-    statuses = build_structured_summary_status(final_state)
-    status_lines = "\n".join(f"- {agent}: {status}" for agent, status in statuses)
-    status_section = f"## 0. Structured Summary Status\n\n{status_lines}\n\n"
-    (save_path / "complete_report.md").write_text(
-        header + status_section + "\n\n".join(sections),
-        encoding="utf-8",
+    critique = "\n\n".join(
+        [
+            f"**Verdict**\n{evaluation.verdict}",
+            f"**Missing Points**\n{evaluation.missing_points}",
+            f"**Unsupported Claims**\n{evaluation.unsupported_claims}",
+            f"**Correction Plan**\n{evaluation.correction_plan}",
+            f"**Prompt Tuning Notes**\n{evaluation.prompt_tuning_notes}",
+        ]
     )
-    return save_path / "complete_report.md"
+    console.print(Panel(Markdown(critique), title="Correction Notes", border_style="cyan", padding=(1, 2)))
 
 
-def append_backtest_summary_to_report(report_file: Path, summary_file: Path):
-    """Append saved backtest summary markdown to the end of complete_report.md."""
-    if not report_file.exists() or not summary_file.exists():
-        return
-    report_text = report_file.read_text(encoding="utf-8")
-    summary_text = summary_file.read_text(encoding="utf-8")
-    merged = report_text.rstrip() + "\n\n---\n\n## VI. Backtest Summary\n\n" + summary_text + "\n"
-    report_file.write_text(merged, encoding="utf-8")
+def save_report_evaluation_to_disk(evaluation, save_path: Path):
+    """Save report evaluation markdown under the report directory."""
+    evaluation_dir = save_path / "7_evaluation"
+    evaluation_dir.mkdir(parents=True, exist_ok=True)
+    file_path = evaluation_dir / "report_evaluation.md"
+    file_path.write_text(render_report_evaluation(evaluation), encoding="utf-8")
+    return file_path
+
+
+def load_reference_text(reference_path: Path) -> str:
+    """Load a local reference answer from markdown/text or saved HTML."""
+    suffix = reference_path.suffix.lower()
+    if suffix in {".html", ".htm"}:
+        return extract_reference_text_from_html_file(reference_path)
+    if suffix == ".pdf":
+        return extract_reference_text_from_pdf_file(reference_path)
+    return reference_path.read_text(encoding="utf-8")
+
+
+def discover_reference_reports(root: Path | None = None) -> list[Path]:
+    """Find local reference reports under the default research directory."""
+    base = (root or Path.cwd() / "研报").expanduser()
+    if not base.exists():
+        return []
+    matches = []
+    for path in sorted(base.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in {".md", ".txt", ".html", ".htm", ".pdf"}:
+            continue
+        if "_files" in path.parts:
+            continue
+        matches.append(path)
+    return matches
+
+
+
+
+def choose_reference_report() -> str:
+    """Select a reference report from `研报/` or enter a custom path."""
+    candidates = discover_reference_reports()
+    choices = [
+        questionary.Choice(str(path.relative_to(Path.cwd())), value=str(path))
+        for path in candidates
+    ]
+    choices.append(questionary.Choice("Manual path entry", value="__manual__"))
+
+    selected = questionary.select(
+        "Select a reference report:",
+        choices=choices,
+        instruction="\n- Use arrow keys to navigate\n- Press Enter to select",
+        style=questionary.Style(
+            [
+                ("selected", "fg:cyan noinherit"),
+                ("highlighted", "fg:cyan noinherit"),
+                ("pointer", "fg:cyan noinherit"),
+            ]
+        ),
+    ).ask()
+
+    if selected == "__manual__":
+        return typer.prompt(
+            "Reference answer path (.md/.txt/.html/.pdf)",
+            default="",
+        ).strip()
+
+    return selected or ""
 
 
 def display_complete_report(final_state):
@@ -862,6 +909,69 @@ def display_complete_report(final_state):
         console.print(Panel("[bold]III. Trading Team Plan[/bold]", border_style="yellow"))
         console.print(Panel(Markdown(final_state["trader_investment_plan"]), title="Trader", border_style="blue", padding=(1, 2)))
 
+    decisioning_items = []
+    if final_state.get("alpha_mining_result"):
+        decisioning_items.append(("QuantaAlpha Mining", final_state["alpha_mining_result"]))
+    if final_state.get("factor_score"):
+        decisioning_items.append(("Factor Score", final_state["factor_score"]))
+    if final_state.get("position_sizing"):
+        decisioning_items.append(("Position Sizing", final_state["position_sizing"]))
+    if final_state.get("risk_gate_result"):
+        decisioning_items.append(("Risk Gate", final_state["risk_gate_result"]))
+    if final_state.get("execution_plan"):
+        decisioning_items.append(("Execution Plan", final_state["execution_plan"]))
+    if decisioning_items:
+        console.print(Panel("[bold]III-B. Stage Two Decisioning[/bold]", border_style="cyan"))
+        for title, payload in decisioning_items:
+            console.print(
+                Panel(
+                    Markdown(f"```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```"),
+                    title=title,
+                    border_style="blue",
+                    padding=(1, 2),
+                )
+            )
+
+    if final_state.get("alpha_experience_summary"):
+        console.print(Panel("[bold]III-C. Alpha Experience Summary[/bold]", border_style="cyan"))
+        alpha_summary = final_state["alpha_experience_summary"]
+        alpha_table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
+        alpha_table.add_column("Field", style="cyan")
+        alpha_table.add_column("Value", style="green")
+        alpha_table.add_row("Registry Entries", str(alpha_summary.get("registry_entry_count", 0)))
+        alpha_table.add_row("History Episodes", str(alpha_summary.get("history_episode_count", 0)))
+        alpha_table.add_row("Selected Alpha", str(alpha_summary.get("selected_alpha_name", "")))
+        alpha_table.add_row("Selected Status", str(alpha_summary.get("selected_alpha_status", "")))
+        alpha_table.add_row("Registry Reuse", str(alpha_summary.get("used_registry_experience", False)))
+        alpha_table.add_row("Avg Realized Return", f"{alpha_summary.get('average_realized_return', 0.0):.2%}")
+        alpha_table.add_row("Avg Realized Alpha", f"{alpha_summary.get('average_realized_alpha', 0.0):.2%}")
+        alpha_table.add_row("Avg Eval Score", f"{alpha_summary.get('average_evaluation_score', 0.0):.4f}")
+        alpha_table.add_row("Positive Alpha Win Rate", f"{alpha_summary.get('positive_alpha_win_rate', 0.0):.2%}")
+        console.print(Panel(alpha_table, title="Alpha Summary", border_style="cyan"))
+        console.print(
+            Panel(
+                Markdown(
+                    f"```json\n{json.dumps(final_state['alpha_experience_summary'], ensure_ascii=False, indent=2)}\n```"
+                ),
+                title="Alpha Experience Summary",
+                border_style="blue",
+                padding=(1, 2),
+            )
+        )
+
+    evidence_items = build_evidence_ledger_sections(final_state)
+    if evidence_items:
+        console.print(Panel("[bold]III-D. Evidence Ledgers[/bold]", border_style="cyan"))
+        for title, payload in evidence_items:
+            console.print(
+                Panel(
+                    Markdown(f"```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```"),
+                    title=title,
+                    border_style="blue",
+                    padding=(1, 2),
+                )
+            )
+
     # IV. Risk Management Team
     if final_state.get("risk_debate_state"):
         risk = final_state["risk_debate_state"]
@@ -882,191 +992,31 @@ def display_complete_report(final_state):
             console.print(Panel("[bold]V. Portfolio Manager Decision[/bold]", border_style="green"))
             console.print(Panel(Markdown(risk["judge_decision"]), title="Portfolio Manager", border_style="blue", padding=(1, 2)))
 
+    report_evaluation = final_state.get("report_evaluation")
+    if report_evaluation:
+        console.print(Panel("[bold]VI. Report Evaluation[/bold]", border_style="cyan"))
+        score_table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
+        score_table.add_column("Dimension", style="cyan")
+        score_table.add_column("Score", style="green")
+        score_table.add_row("Factual Coverage", f"{report_evaluation.get('factual_coverage', 0.0):.1f}/10")
+        score_table.add_row("Evidence Support", f"{report_evaluation.get('evidence_support', 0.0):.1f}/10")
+        score_table.add_row("Reasoning Consistency", f"{report_evaluation.get('reasoning_consistency', 0.0):.1f}/10")
+        score_table.add_row("Risk Awareness", f"{report_evaluation.get('risk_awareness', 0.0):.1f}/10")
+        score_table.add_row("Actionability", f"{report_evaluation.get('actionability', 0.0):.1f}/10")
+        score_table.add_row("Writing Quality", f"{report_evaluation.get('writing_quality', 0.0):.1f}/10")
+        score_table.add_row("Total", f"{report_evaluation.get('total_score', 0.0):.1f}/100")
+        console.print(Panel(score_table, title="Scorecard", border_style="cyan"))
 
-def display_backtest_result(result, ticker: str, trade_date: str, holding_days: int):
-    """Display a minimal backtest result for the current analysis scenario."""
-    console.print()
-    console.print(Rule("Backtest Result", style="bold yellow"))
-
-    if not result.trades:
-        console.print(
-            Panel(
-                f"No backtest trade could be resolved for {ticker} on {trade_date}.\n"
-                "This usually means future price data is not yet available for the requested holding window.",
-                title="Backtest",
-                border_style="yellow",
-                padding=(1, 2),
-            )
+        critique = "\n\n".join(
+            [
+                f"**Verdict**\n{report_evaluation.get('verdict', '')}",
+                f"**Missing Points**\n{report_evaluation.get('missing_points', '')}",
+                f"**Unsupported Claims**\n{report_evaluation.get('unsupported_claims', '')}",
+                f"**Correction Plan**\n{report_evaluation.get('correction_plan', '')}",
+                f"**Prompt Tuning Notes**\n{report_evaluation.get('prompt_tuning_notes', '')}",
+            ]
         )
-        return
-
-    trade = result.trades[0]
-    trade_table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
-    trade_table.add_column("Field", style="cyan")
-    trade_table.add_column("Value", style="green")
-    trade_table.add_row("Ticker", trade.ticker)
-    trade_table.add_row("Trade Date", trade.trade_date)
-    trade_table.add_row("Rating", trade.rating)
-    trade_table.add_row("Holding Days", str(trade.holding_days))
-    trade_table.add_row("Benchmark", trade.benchmark)
-    trade_table.add_row("Raw Return", f"{trade.raw_return:.2%}")
-    trade_table.add_row("Alpha Return", f"{trade.alpha_return:.2%}")
-    trade_table.add_row("Confidence", f"{trade.confidence:.2%}")
-
-    metrics = result.metrics
-    metrics_table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
-    metrics_table.add_column("Metric", style="cyan")
-    metrics_table.add_column("Value", style="green")
-    metrics_table.add_row("Trade Count", str(metrics.trade_count))
-    metrics_table.add_row("Total Return", f"{metrics.total_return:.2%}")
-    metrics_table.add_row("Average Return", f"{metrics.average_return:.2%}")
-    metrics_table.add_row("Average Alpha", f"{metrics.average_alpha:.2%}")
-    metrics_table.add_row("Win Rate", f"{metrics.win_rate:.2%}")
-    metrics_table.add_row("Loss Rate", f"{metrics.loss_rate:.2%}")
-    metrics_table.add_row("Volatility", f"{metrics.volatility:.4f}")
-    metrics_table.add_row("Sharpe Ratio", f"{metrics.sharpe_ratio:.4f}")
-    metrics_table.add_row("Max Drawdown", f"{metrics.max_drawdown:.2%}")
-
-    console.print(Panel(trade_table, title=f"Scenario Backtest ({holding_days}d)", border_style="yellow"))
-    console.print(Panel(metrics_table, title="Backtest Metrics", border_style="yellow"))
-
-
-def save_backtest_result_to_disk(result, ticker: str, trade_date: str, holding_days: int, save_path: Path):
-    """Save a single backtest result to disk."""
-    save_path.mkdir(parents=True, exist_ok=True)
-    file_path = save_path / f"backtest_{ticker}_{trade_date}_{holding_days}d.md"
-
-    lines = [
-        f"# Backtest Result: {ticker}",
-        "",
-        f"- Trade Date: {trade_date}",
-        f"- Holding Days: {holding_days}",
-        "",
-    ]
-
-    if not result.trades:
-        lines.extend([
-            "## Outcome",
-            "",
-            "No backtest trade could be resolved for this scenario.",
-        ])
-    else:
-        trade = result.trades[0]
-        metrics = result.metrics
-        lines.extend([
-            "## Trade",
-            "",
-            f"- Rating: {trade.rating}",
-            f"- Benchmark: {trade.benchmark}",
-            f"- Raw Return: {trade.raw_return:.2%}",
-            f"- Alpha Return: {trade.alpha_return:.2%}",
-            f"- Confidence: {trade.confidence:.2%}",
-            "",
-            "## Metrics",
-            "",
-            f"- Trade Count: {metrics.trade_count}",
-            f"- Total Return: {metrics.total_return:.2%}",
-            f"- Average Return: {metrics.average_return:.2%}",
-            f"- Average Alpha: {metrics.average_alpha:.2%}",
-            f"- Win Rate: {metrics.win_rate:.2%}",
-            f"- Loss Rate: {metrics.loss_rate:.2%}",
-            f"- Volatility: {metrics.volatility:.4f}",
-            f"- Sharpe Ratio: {metrics.sharpe_ratio:.4f}",
-            f"- Max Drawdown: {metrics.max_drawdown:.2%}",
-        ])
-
-    file_path.write_text("\n".join(lines), encoding="utf-8")
-    return file_path
-
-
-def parse_holding_days_input(raw: str) -> list[int]:
-    raw = raw.replace("，", ",").replace(" ", "")
-    values = []
-    for part in raw.split(","):
-        token = part.strip()
-        if not token:
-            continue
-        values.append(max(1, int(token)))
-    return values or [5]
-
-
-def display_backtest_summary(results: list[tuple[int, object]]):
-    """Display a compact multi-horizon backtest summary table."""
-    console.print()
-    console.print(Rule("Backtest Summary", style="bold yellow"))
-
-    summary_table = Table(show_header=True, header_style="bold magenta", box=box.SIMPLE)
-    summary_table.add_column("Holding Days", style="cyan")
-    summary_table.add_column("Trade Count", style="green")
-    summary_table.add_column("Rating", style="yellow")
-    summary_table.add_column("Raw Return", style="green")
-    summary_table.add_column("Alpha Return", style="green")
-    summary_table.add_column("Win Rate", style="green")
-    summary_table.add_column("Sharpe", style="green")
-    summary_table.add_column("Max DD", style="green")
-
-    for holding_days, result in results:
-        if result.trades:
-            trade = result.trades[0]
-            metrics = result.metrics
-            summary_table.add_row(
-                str(holding_days),
-                str(metrics.trade_count),
-                trade.rating,
-                f"{trade.raw_return:.2%}",
-                f"{trade.alpha_return:.2%}",
-                f"{metrics.win_rate:.2%}",
-                f"{metrics.sharpe_ratio:.4f}",
-                f"{metrics.max_drawdown:.2%}",
-            )
-        else:
-            summary_table.add_row(
-                str(holding_days),
-                "0",
-                "N/A",
-                "N/A",
-                "N/A",
-                "N/A",
-                "N/A",
-                "N/A",
-            )
-
-    console.print(Panel(summary_table, title="Multi-Horizon Comparison", border_style="yellow"))
-
-
-def save_backtest_summary_to_disk(
-    results: list[tuple[int, object]],
-    ticker: str,
-    trade_date: str,
-    save_path: Path,
-):
-    """Save a compact multi-horizon backtest summary markdown file."""
-    save_path.mkdir(parents=True, exist_ok=True)
-    file_path = save_path / f"backtest_summary_{ticker}_{trade_date}.md"
-
-    lines = [
-        f"# Backtest Summary: {ticker}",
-        "",
-        f"- Trade Date: {trade_date}",
-        "",
-        "| Holding Days | Trade Count | Rating | Raw Return | Alpha Return | Win Rate | Sharpe | Max Drawdown |",
-        "|---|---:|---|---:|---:|---:|---:|---:|",
-    ]
-
-    for holding_days, result in results:
-        if result.trades:
-            trade = result.trades[0]
-            metrics = result.metrics
-            lines.append(
-                f"| {holding_days} | {metrics.trade_count} | {trade.rating} | "
-                f"{trade.raw_return:.2%} | {trade.alpha_return:.2%} | "
-                f"{metrics.win_rate:.2%} | {metrics.sharpe_ratio:.4f} | {metrics.max_drawdown:.2%} |"
-            )
-        else:
-            lines.append(f"| {holding_days} | 0 | N/A | N/A | N/A | N/A | N/A | N/A |")
-
-    file_path.write_text("\n".join(lines), encoding="utf-8")
-    return file_path
+        console.print(Panel(Markdown(critique), title="Correction Notes", border_style="cyan", padding=(1, 2)))
 
 
 def update_research_team_status(status):
@@ -1211,6 +1161,83 @@ def format_tool_args(args, max_length=80) -> str:
         return result[:max_length - 3] + "..."
     return result
 
+
+def _load_alpha_state_file(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _collect_alpha_state_files(source: Path) -> list[Path]:
+    if source.is_dir():
+        return sorted(source.glob("full_states_log_*.json"))
+    return [source]
+
+
+def _alpha_candidates_from_payload(payload: dict) -> list[AlphaCandidate]:
+    alpha_result = payload.get("alpha_mining_result", {}) or {}
+    selected = alpha_result.get("selected_alpha", {}) or {}
+    candidates_payload = alpha_result.get("candidates", []) or []
+    candidates: list[AlphaCandidate] = []
+
+    for candidate_payload in candidates_payload:
+        if not isinstance(candidate_payload, dict):
+            continue
+        candidates.append(
+            AlphaCandidate(
+                name=str(candidate_payload.get("name", "unknown_alpha")),
+                hypothesis=str(candidate_payload.get("hypothesis", "")),
+                expression=str(candidate_payload.get("expression", "")),
+                signal_score=float(candidate_payload.get("signal_score", 0.0)),
+                confidence=float(candidate_payload.get("confidence", 0.0)),
+                complexity=int(candidate_payload.get("complexity", 1)),
+                validation_status=str(candidate_payload.get("validation_status", "unknown")),
+                evidence=[str(item) for item in candidate_payload.get("evidence", [])],
+            )
+        )
+
+    if not candidates and selected:
+        candidates.append(
+            AlphaCandidate(
+                name=str(selected.get("name", "unknown_alpha")),
+                hypothesis=str(selected.get("hypothesis", "")),
+                expression=str(selected.get("expression", "")),
+                signal_score=float(selected.get("signal_score", 0.0)),
+                confidence=float(selected.get("confidence", 0.0)),
+                complexity=int(selected.get("complexity", 1)),
+                validation_status=str(selected.get("validation_status", "unknown")),
+                evidence=[str(item) for item in selected.get("evidence", [])],
+            )
+        )
+    return candidates
+
+
+def _build_alpha_registry_entry(payload: dict, source_path: Path) -> AlphaRegistryEntry:
+    alpha_result = payload.get("alpha_mining_result", {}) or {}
+    selected = alpha_result.get("selected_alpha", {}) or {}
+    return AlphaRegistryEntry(
+        name=str(selected.get("name", "unknown_alpha")),
+        hypothesis=str(selected.get("hypothesis", "")),
+        expression=str(selected.get("expression", "")),
+        signal_score=float(alpha_result.get("signal_score", 0.0)),
+        confidence=float(alpha_result.get("confidence", 0.0)),
+        stability=float(alpha_result.get("stability", 0.0)),
+        redundancy_penalty=float(alpha_result.get("redundancy_penalty", 0.0)),
+        evidence=[str(item) for item in selected.get("evidence", [])],
+        source=str(source_path),
+        trade_date=str(payload.get("trade_date", "")),
+        realized_return=float(alpha_result.get("realized_return", 0.0)),
+        realized_alpha=float(alpha_result.get("realized_alpha", 0.0)),
+        evaluation_score=float(alpha_result.get("evaluation_score", 0.0)),
+    )
+
+
+def _resolve_benchmark_from_default_config(ticker: str) -> str:
+    benchmark_map = DEFAULT_CONFIG.get("benchmark_map", {})
+    ticker_upper = ticker.upper()
+    for suffix, benchmark in benchmark_map.items():
+        if suffix and ticker_upper.endswith(suffix.upper()):
+            return benchmark
+    return benchmark_map.get("", "SPY")
+
 def run_analysis(checkpoint: bool = False):
     # First get all user selections
     selections = get_user_selections()
@@ -1228,6 +1255,7 @@ def run_analysis(checkpoint: bool = False):
     config["openai_reasoning_effort"] = selections.get("openai_reasoning_effort")
     config["anthropic_effort"] = selections.get("anthropic_effort")
     config["output_language"] = selections.get("output_language", "English")
+    config["analysis_lookback_days"] = selections.get("analysis_lookback_days", 30)
     config["checkpoint_enabled"] = checkpoint
 
     # Create stats callback handler for tracking LLM/tool calls
@@ -1340,6 +1368,7 @@ def run_analysis(checkpoint: bool = False):
             selections["ticker"],
             selections["analysis_date"],
             asset_type=selections["asset_type"],
+            analysis_lookback_days=selections.get("analysis_lookback_days", 30),
         )
         # Pass callbacks to graph config for tool execution tracking
         # (LLM tracking is handled separately via LLM constructor)
@@ -1456,6 +1485,11 @@ def run_analysis(checkpoint: bool = False):
         for chunk in trace:
             final_state.update(chunk)
         decision = graph.process_signal(final_state["final_trade_decision"])
+        graph.curr_state = final_state
+        final_state.setdefault("time_context", init_agent_state.get("time_context", {}))
+        final_state["data_snapshot"] = DataSnapshot.from_state(final_state).to_log_payload()
+        graph.ticker = selections["ticker"]
+        graph._log_state(selections["analysis_date"], final_state)
 
         # Update all agent statuses to completed
         for agent in message_buffer.agent_status:
@@ -1497,20 +1531,65 @@ def run_analysis(checkpoint: bool = False):
         except Exception as e:
             console.print(f"[red]Error saving report: {e}[/red]")
 
+    if report_file is not None:
+        eval_choice = typer.prompt(
+            "\nEvaluate report against a reference answer?",
+            default="N",
+        ).strip().upper()
+        if eval_choice in ("Y", "YES"):
+            if discover_reference_reports():
+                reference_path_raw = choose_reference_report()
+            else:
+                reference_path_raw = typer.prompt(
+                    "Reference answer path (.md/.txt/.html/.pdf)",
+                    default="",
+                ).strip()
+            reference_path = Path(reference_path_raw).expanduser()
+            if not reference_path_raw or not reference_path.exists():
+                console.print("[yellow]Reference answer not found; skipping report evaluation.[/yellow]")
+            else:
+                topic = typer.prompt(
+                    "Evaluation topic label (press Enter to use ticker/date)",
+                    default=f"{selections['ticker']} {selections['analysis_date']}",
+                ).strip()
+                try:
+                    evaluator = ReportEvaluator(graph.quick_thinking_llm)
+                    evaluation = evaluator.evaluate(
+                        report_file.read_text(encoding="utf-8"),
+                        load_reference_text(reference_path),
+                        topic=topic,
+                    )
+                    display_report_evaluation(evaluation)
+                    final_state["report_evaluation"] = evaluation.model_dump()
+                    if report_save_path is not None:
+                        evaluation_file = save_report_evaluation_to_disk(evaluation, report_save_path)
+                        console.print(f"[green]✓ Report evaluation saved:[/green] {evaluation_file.resolve()}")
+                        if report_file is not None:
+                            append_report_evaluation_to_report(report_file, evaluation_file)
+                            console.print(f"[green]✓ Appended report evaluation to:[/green] {report_file.resolve()}")
+                except Exception as e:
+                    console.print(f"[red]Error evaluating report: {e}[/red]")
+
     # Prompt to run a minimal forward backtest for the current historical scenario
     backtest_choice = typer.prompt(
         "\nRun backtest on this analysis result using future historical data?",
         default="N",
     ).strip().upper()
     if backtest_choice in ("Y", "YES"):
+        initial_capital_raw = typer.prompt(
+            "Initial capital for backtest (press Enter for normalized 1.0)",
+            default="1.0",
+        ).strip()
         holding_days_raw = typer.prompt(
             "Holding days for backtest (comma-separated)",
             default="5,10,20",
         ).strip()
         try:
+            initial_capital = parse_initial_capital_input(initial_capital_raw)
             holding_days_list = parse_holding_days_input(holding_days_raw)
         except ValueError:
-            console.print("[yellow]Invalid holding days; using default 5,10,20.[/yellow]")
+            console.print("[yellow]Invalid capital or holding days; using defaults 1.0 and 5,10,20.[/yellow]")
+            initial_capital = 1.0
             holding_days_list = [5, 10, 20]
 
         try:
@@ -1529,6 +1608,7 @@ def run_analysis(checkpoint: bool = False):
                     [scenario],
                     [final_state],
                     holding_days=holding_days,
+                    initial_capital=initial_capital,
                 )
                 display_backtest_result(
                     backtest_result,
@@ -1561,6 +1641,36 @@ def run_analysis(checkpoint: bool = False):
         except Exception as e:
             console.print(f"[red]Error running backtest: {e}[/red]")
 
+    alpha_mining_choice = typer.prompt(
+        "\nRun alpha mining on this analysis result now?",
+        default="N",
+    ).strip().upper()
+    if alpha_mining_choice in ("Y", "YES"):
+        alpha_source = (
+            Path(DEFAULT_CONFIG["results_dir"])
+            / selections["ticker"]
+            / "TradingAgentsStrategy_logs"
+            / f"full_states_log_{selections['analysis_date']}.json"
+        )
+        try:
+            registry_file, history_file = run_alpha_mining_for_source(
+                alpha_source,
+                load_alpha_state_file=_load_alpha_state_file,
+                collect_alpha_state_files=_collect_alpha_state_files,
+                build_alpha_registry_entry=_build_alpha_registry_entry,
+                resolve_benchmark_from_default_config=_resolve_benchmark_from_default_config,
+            )
+            print_alpha_mining_success(alpha_source, registry_file, history_file)
+            registry_rows = AlphaRegistry(registry_file).load()
+            history_rows = AlphaMiningHistory(history_file).load()
+            final_state["alpha_experience_summary"] = build_alpha_experience_summary(
+                registry_rows,
+                history_rows,
+                selected_alpha=final_state.get("alpha_mining_result", {}).get("selected_alpha", {}),
+            )
+        except Exception as e:
+            console.print(f"[red]Error running alpha mining: {e}[/red]")
+
     # Prompt to display full report
     display_choice = typer.prompt("\nDisplay full report on screen?", default="Y").strip().upper()
     if display_choice in ("Y", "YES", ""):
@@ -1580,12 +1690,135 @@ def analyze(
         help="Delete all saved checkpoints before running (force fresh start).",
     ),
 ):
+    """Run the standard TradingAgents analysis flow."""
     if clear_checkpoints:
         from tradingagents.graph.checkpointer import clear_all_checkpoints
         n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
         console.print(f"[yellow]Cleared {n} checkpoint(s).[/yellow]")
     run_analysis(checkpoint=checkpoint)
 
+
+@app.command("evaluate-report")
+def evaluate_report(
+    report_path: str = typer.Argument(..., help="Path to generated complete_report.md"),
+    reference_path: Optional[str] = typer.Argument(None, help="Path to reference answer markdown/text/html/pdf"),
+    topic: str = typer.Option("", "--topic", help="Optional topic label for the evaluator"),
+    output_path: Optional[str] = typer.Option(
+        None,
+        "--output",
+        help="Optional output path. Defaults to <report_dir>/7_evaluation/report_evaluation.md",
+    ),
+):
+    """Evaluate a saved research report against a reference answer."""
+    report_file = Path(report_path).expanduser()
+    if reference_path:
+        reference_file = Path(reference_path).expanduser()
+    else:
+        chosen = choose_reference_report() if discover_reference_reports() else ""
+        if not chosen:
+            console.print("[red]No reference report selected.[/red]")
+            raise typer.Exit(code=1)
+        reference_file = Path(chosen).expanduser()
+
+    if not report_file.exists():
+        console.print(f"[red]Report file not found:[/red] {report_file}")
+        raise typer.Exit(code=1)
+    if not reference_file.exists():
+        console.print(f"[red]Reference answer not found:[/red] {reference_file}")
+        raise typer.Exit(code=1)
+
+    config = DEFAULT_CONFIG.copy()
+    graph = TradingAgentsGraph(config=config, debug=False)
+    evaluator = ReportEvaluator(graph.quick_thinking_llm)
+    evaluation = evaluator.evaluate(
+        report_file.read_text(encoding="utf-8"),
+        load_reference_text(reference_file),
+        topic=topic,
+    )
+    display_report_evaluation(evaluation)
+
+    if output_path:
+        destination = Path(output_path).expanduser()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(render_report_evaluation(evaluation), encoding="utf-8")
+        saved_path = destination
+    else:
+        saved_path = save_report_evaluation_to_disk(evaluation, report_file.parent)
+
+    console.print(f"[green]✓ Report evaluation saved:[/green] {saved_path.resolve()}")
+
+
+@app.command("extract-reference")
+def extract_reference(
+    html_path: str = typer.Argument(..., help="Path to saved local HTML or PDF report"),
+    output_path: Optional[str] = typer.Option(
+        None,
+        "--output",
+        help="Optional markdown/text output path. Defaults to the same filename with .md",
+    ),
+):
+    """Extract readable reference text from a saved local HTML report."""
+    source = Path(html_path).expanduser()
+    if not source.exists():
+        console.print(f"[red]HTML file not found:[/red] {source}")
+        raise typer.Exit(code=1)
+
+    if output_path:
+        destination = Path(output_path).expanduser()
+    else:
+        destination = source.with_suffix(".md")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    suffix = source.suffix.lower()
+    if suffix in {".html", ".htm"}:
+        text = extract_reference_text_from_html_file(source)
+    elif suffix == ".pdf":
+        text = extract_reference_text_from_pdf_file(source)
+    else:
+        console.print(f"[red]Unsupported reference format:[/red] {source.suffix}")
+        raise typer.Exit(code=1)
+
+    destination.write_text(text, encoding="utf-8")
+    console.print(f"[green]✓ Extracted reference saved:[/green] {destination.resolve()}")
+
+
+@app.command("mine-alpha")
+def mine_alpha(
+    source_path: Optional[str] = typer.Argument(None, help="Path to a full_states_log_*.json file or directory"),
+    registry_path: Optional[str] = typer.Option(
+        None,
+        "--registry",
+        help="Optional registry JSON path. Defaults to <source_dir>/alpha_registry.json",
+    ),
+    history_path: Optional[str] = typer.Option(
+        None,
+        "--history",
+        help="Optional history JSON path. Defaults to <source_dir>/alpha_history.json",
+    ),
+):
+    """Mine alpha candidates from saved analysis states and persist the best ones."""
+    if source_path:
+        source = Path(source_path).expanduser()
+    else:
+        chosen = choose_alpha_source() if discover_alpha_sources() else ""
+        if not chosen:
+            console.print("[red]No alpha source selected.[/red]")
+            raise typer.Exit(code=1)
+        source = Path(chosen).expanduser()
+    registry_file_arg = Path(registry_path).expanduser() if registry_path else None
+    history_file_arg = Path(history_path).expanduser() if history_path else None
+    registry_file, history_file = run_alpha_mining_for_source(
+        source,
+        registry_path=registry_file_arg,
+        history_path=history_file_arg,
+        load_alpha_state_file=_load_alpha_state_file,
+        collect_alpha_state_files=_collect_alpha_state_files,
+        build_alpha_registry_entry=_build_alpha_registry_entry,
+        resolve_benchmark_from_default_config=_resolve_benchmark_from_default_config,
+    )
+    console.print(f"[green]✓ {alpha_text('Alpha mining completed for:', 'Alpha 因子挖掘完成：')}[/green] {source.resolve()}")
+    console.print(f"[green]✓ {alpha_text('Registry saved:', 'Registry 已保存：')}[/green] {registry_file.resolve()}")
+    console.print(f"[green]✓ {alpha_text('History saved:', 'History 已保存：')}[/green] {history_file.resolve()}")
 
 if __name__ == "__main__":
     app()

@@ -13,7 +13,9 @@ from tradingagents.agents.schemas import (
 )
 from tradingagents.agents.utils.agent_utils import (
     build_compact_feature_context,
+    build_data_quality_context,
     build_instrument_context,
+    build_quant_summary_context,
     get_language_instruction,
 )
 from tradingagents.agents.utils.structured import (
@@ -30,6 +32,8 @@ def create_trader(llm):
         asset_type = state.get("asset_type", "stock")
         instrument_context = build_instrument_context(company_name, asset_type)
         feature_context = build_compact_feature_context(state)
+        data_quality_context = build_data_quality_context(state)
+        quant_context = build_quant_summary_context(state)
         investment_plan = state["investment_plan"]
 
         messages = [
@@ -49,8 +53,9 @@ def create_trader(llm):
                     f"plan tailored for {company_name}. {instrument_context} This plan incorporates "
                     f"insights from current technical market trends, macroeconomic indicators, and "
                     f"social media sentiment. Use this plan as a foundation for evaluating your next "
-                    f"trading decision.\n\n{feature_context}\n\nProposed Investment Plan: {investment_plan}\n\n"
+                    f"trading decision.\n\n{feature_context}\n\n{data_quality_context}\n\n{quant_context}\n\nProposed Investment Plan: {investment_plan}\n\n"
                     f"Leverage these insights to make an informed and strategic decision.\n\n"
+                    "Do not restate the investment plan at length. Add decision-relevant increment: quantify the setup, explain the action under a base case and a failure case, and translate the plan into a concrete trading stance.\n\n"
                     "First write your natural-language trading rationale. Then append a machine-readable "
                     "summary block in exactly this format:\n\n"
                     "STRUCTURED_SUMMARY\n"

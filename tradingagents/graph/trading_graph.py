@@ -1,6 +1,7 @@
 # TradingAgents/graph/trading_graph.py
 
 import logging
+import copy
 import os
 from pathlib import Path
 import json
@@ -33,6 +34,7 @@ from tradingagents.dataflows.interface import route_to_vendor
 # Import the new abstract tool methods from agent_utils
 from tradingagents.agents.utils.agent_utils import (
     get_stock_data,
+    get_crypto_market_snapshot,
     get_indicators,
     get_fundamentals,
     get_balance_sheet,
@@ -56,7 +58,7 @@ class TradingAgentsGraph:
 
     def __init__(
         self,
-        selected_analysts=["market", "social", "news", "fundamentals"],
+        selected_analysts=None,
         debug=False,
         config: Dict[str, Any] = None,
         callbacks: Optional[List] = None,
@@ -70,8 +72,13 @@ class TradingAgentsGraph:
             callbacks: Optional list of callback handlers (e.g., for tracking LLM/tool stats)
         """
         self.debug = debug
-        self.config = config or DEFAULT_CONFIG
+        self.config = (
+            copy.deepcopy(config)
+            if config is not None
+            else copy.deepcopy(DEFAULT_CONFIG)
+        )
         self.callbacks = callbacks or []
+        selected_analysts = selected_analysts or ["market", "social", "news", "fundamentals"]
 
         # Update the interface's config
         set_config(self.config)
@@ -102,6 +109,7 @@ class TradingAgentsGraph:
 
         self.deep_thinking_llm = deep_client.get_llm()
         self.quick_thinking_llm = quick_client.get_llm()
+        self.role_llms = self._create_role_llms(llm_kwargs)
         
         self.memory_log = TradingMemoryLog(self.config)
 
@@ -119,6 +127,7 @@ class TradingAgentsGraph:
             self.tool_nodes,
             self.conditional_logic,
             analyst_concurrency_limit=self.config.get("analyst_concurrency_limit", 1),
+            role_llms=self.role_llms,
         )
 
         self.propagator = Propagator(
@@ -142,6 +151,15 @@ class TradingAgentsGraph:
         """Get provider-specific kwargs for LLM client creation."""
         kwargs = {}
         provider = self.config.get("llm_provider", "").lower()
+        timeout = self.config.get("timeout")
+        max_retries = self.config.get("max_retries")
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        if max_retries is not None:
+            kwargs["max_retries"] = max_retries
+        api_key = self.config.get("api_key")
+        if api_key:
+            kwargs["api_key"] = api_key
 
         if provider == "google":
             thinking_level = self.config.get("google_thinking_level")
@@ -160,6 +178,38 @@ class TradingAgentsGraph:
 
         return kwargs
 
+    def _create_role_llms(self, llm_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Create optional role-specific LLMs.
+
+        Empty role model config falls back in GraphSetup:
+        analysis/debate -> quick_thinking_llm, decision -> deep_thinking_llm.
+        """
+        role_config = {
+            "analysis": self.config.get("analysis_think_llm"),
+            "debate": self.config.get("debate_think_llm"),
+            "decision": self.config.get("decision_think_llm"),
+        }
+        role_llms: Dict[str, Any] = {}
+        for role, model in role_config.items():
+            model_name = str(model or "").strip()
+            if not model_name:
+                continue
+            fallback = (
+                self.config["deep_think_llm"]
+                if role == "decision"
+                else self.config["quick_think_llm"]
+            )
+            if model_name == fallback:
+                continue
+            client = create_llm_client(
+                provider=self.config["llm_provider"],
+                model=model_name,
+                base_url=self.config.get("backend_url"),
+                **llm_kwargs,
+            )
+            role_llms[role] = client.get_llm()
+        return role_llms
+
     def _create_tool_nodes(self) -> Dict[str, ToolNode]:
         """Create tool nodes for different data sources using abstract methods."""
         return {
@@ -167,6 +217,8 @@ class TradingAgentsGraph:
                 [
                     # Core stock data tools
                     get_stock_data,
+                    # Crypto-native market context
+                    get_crypto_market_snapshot,
                     # Technical indicators
                     get_indicators,
                 ]
@@ -212,6 +264,8 @@ class TradingAgentsGraph:
             return explicit
         benchmark_map = self.config.get("benchmark_map", {})
         ticker_upper = ticker.upper()
+        if ticker_upper.endswith(("-USD", "-USDT", "-USDC")):
+            return self.config.get("crypto_benchmark_ticker") or "BTC-USD"
         for suffix, benchmark in benchmark_map.items():
             if suffix and ticker_upper.endswith(suffix.upper()):
                 return benchmark
@@ -276,7 +330,7 @@ class TradingAgentsGraph:
         """Load post-analysis price history via the same vendor-compat path used elsewhere."""
         payload = route_to_vendor("get_stock_data", symbol, start_date, end_date)
         df = self._parse_price_payload_to_dataframe(payload)
-        if not df.empty:
+        if isinstance(df, pd.DataFrame) and not df.empty:
             return df
         return yf.Ticker(symbol).history(start=start_date, end=end_date)
 
@@ -445,13 +499,29 @@ class TradingAgentsGraph:
         """Log the final state to a JSON file."""
         self.log_states_dict[str(trade_date)] = {
             "company_of_interest": final_state["company_of_interest"],
+            "asset_type": final_state.get("asset_type", "stock"),
             "trade_date": final_state["trade_date"],
             "time_context": final_state.get("time_context", {}),
             "data_snapshot": final_state.get("data_snapshot", {}),
             "market_report": final_state["market_report"],
+            "market_features": final_state.get("market_features", {}),
+            "market_evidence_ledger": final_state.get("market_evidence_ledger", {}),
             "sentiment_report": final_state["sentiment_report"],
+            "sentiment_features": final_state.get("sentiment_features", {}),
+            "sentiment_evidence_ledger": final_state.get("sentiment_evidence_ledger", {}),
             "news_report": final_state["news_report"],
+            "news_features": final_state.get("news_features", {}),
+            "news_evidence_ledger": final_state.get("news_evidence_ledger", {}),
             "fundamentals_report": final_state["fundamentals_report"],
+            "fundamentals_features": final_state.get("fundamentals_features", {}),
+            "fundamentals_evidence_ledger": final_state.get("fundamentals_evidence_ledger", {}),
+            "alpha_mining_result": final_state.get("alpha_mining_result", {}),
+            "alpha_experience_summary": final_state.get("alpha_experience_summary", {}),
+            "factor_score": final_state.get("factor_score", {}),
+            "position_sizing": final_state.get("position_sizing", {}),
+            "risk_gate_result": final_state.get("risk_gate_result", {}),
+            "execution_plan": final_state.get("execution_plan", {}),
+            "run_metrics": final_state.get("run_metrics", {}),
             "investment_debate_state": {
                 "bull_history": final_state["investment_debate_state"]["bull_history"],
                 "bear_history": final_state["investment_debate_state"]["bear_history"],
@@ -504,19 +574,26 @@ class TradingAgentsGraph:
         self,
         scenarios: List[BacktestScenario],
         holding_days: int = 5,
+        initial_capital: float = 1.0,
     ) -> BacktestResult:
         """Run a baseline batch backtest over multiple scenarios."""
-        return self.backtester.run(scenarios, holding_days=holding_days)
+        return self.backtester.run(
+            scenarios,
+            holding_days=holding_days,
+            initial_capital=initial_capital,
+        )
 
     def run_backtest_from_final_states(
         self,
         scenarios: List[BacktestScenario],
         final_states: List[dict[str, Any]],
         holding_days: int = 5,
+        initial_capital: float = 1.0,
     ) -> BacktestResult:
         """Backtest already-computed analysis results without re-running the graph."""
         return self.backtester.run_from_final_states(
             scenarios,
             final_states,
             holding_days=holding_days,
+            initial_capital=initial_capital,
         )

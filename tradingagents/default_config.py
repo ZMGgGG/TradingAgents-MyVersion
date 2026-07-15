@@ -17,6 +17,9 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_MAX_RISK_ROUNDS":      "max_risk_discuss_rounds",
     "TRADINGAGENTS_CHECKPOINT_ENABLED":   "checkpoint_enabled",
     "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
+    "TRADINGAGENTS_CRYPTO_BENCHMARK_TICKER": "crypto_benchmark_ticker",
+    "TRADINGAGENTS_LLM_TIMEOUT":          "timeout",
+    "TRADINGAGENTS_LLM_MAX_RETRIES":      "max_retries",
 }
 
 
@@ -46,6 +49,9 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "results_dir": os.getenv("TRADINGAGENTS_RESULTS_DIR", os.path.join(_TRADINGAGENTS_HOME, "logs")),
     "data_cache_dir": os.getenv("TRADINGAGENTS_CACHE_DIR", os.path.join(_TRADINGAGENTS_HOME, "cache")),
     "memory_log_path": os.getenv("TRADINGAGENTS_MEMORY_LOG_PATH", os.path.join(_TRADINGAGENTS_HOME, "memory", "trading_memory.md")),
+    "alpha_registry_path": os.getenv("TRADINGAGENTS_ALPHA_REGISTRY_PATH", os.path.join(_TRADINGAGENTS_HOME, "alpha", "alpha_registry.json")),
+    "alpha_history_path": os.getenv("TRADINGAGENTS_ALPHA_HISTORY_PATH", os.path.join(_TRADINGAGENTS_HOME, "alpha", "alpha_history.json")),
+    "vendor_trace_level": os.getenv("TRADINGAGENTS_VENDOR_TRACE_LEVEL", "summary"),
     # Optional cap on the number of resolved memory log entries. When set,
     # the oldest resolved entries are pruned once this limit is exceeded.
     # Pending entries are never pruned. None disables rotation entirely.
@@ -54,6 +60,9 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "llm_provider": "openai",
     "deep_think_llm": "gpt-5.4",
     "quick_think_llm": "gpt-5.4-mini",
+    "analysis_think_llm": None,
+    "debate_think_llm": None,
+    "decision_think_llm": None,
     # When None, each provider's client falls back to its own default endpoint
     # (api.openai.com for OpenAI, generativelanguage.googleapis.com for Gemini, ...).
     # The CLI overrides this per provider when the user picks one. Keeping a
@@ -64,17 +73,21 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "google_thinking_level": None,      # "high", "minimal", etc.
     "openai_reasoning_effort": None,    # "medium", "high", "low"
     "anthropic_effort": None,           # "high", "medium", "low"
+    "timeout": 90,
+    "max_retries": 2,
     # Checkpoint/resume: when True, LangGraph saves state after each node
     # so a crashed run can resume from the last successful step.
     "checkpoint_enabled": False,
     # Output language for analyst reports and final decision
     # Internal agent debate stays in English for reasoning quality
     "output_language": "English",
+    "analysis_lookback_days": 30,
     # Debate and discussion settings
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,
     "max_recur_limit": 100,
     "analyst_concurrency_limit": 1,
+    "parallel_analysts": False,
     # News / data fetching parameters
     # Increase for longer lookback strategies or to broaden macro coverage;
     # decrease to reduce token usage in agent prompts.
@@ -109,6 +122,7 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # so the reflection label keeps reading "Alpha vs SPY" for US tickers
     # while non-US tickers get their regional index automatically.
     "benchmark_ticker": None,
+    "crypto_benchmark_ticker": "BTC-USD",
     "benchmark_map": {
         ".SS":  "000300.SS",  # CSI 300
         ".SZ":  "399001.SZ",  # Shenzhen Component

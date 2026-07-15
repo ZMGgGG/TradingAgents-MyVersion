@@ -1,5 +1,6 @@
 import pytest
 
+from tradingagents.alpha_mining import QuantaAlphaMiner
 from tradingagents.decisioning.factor_engine import FactorEngine
 from tradingagents.decisioning.position_sizing import PositionSizer
 from tradingagents.decisioning.risk_gate import RiskGate
@@ -41,6 +42,72 @@ def test_factor_engine_prefers_structured_feature_scores():
     assert score.fundamentals == 0.6
     assert score.sentiment == 0.4
     assert score.news == 0.2
+
+
+@pytest.mark.unit
+def test_factor_engine_applies_sentiment_quality_weight():
+    engine = FactorEngine()
+    state = {
+        "market_report": "",
+        "fundamentals_report": "",
+        "sentiment_report": "",
+        "news_report": "",
+        "market_features": {"score": 0.0},
+        "fundamentals_features": {"score": 0.0},
+        "sentiment_features": {
+            "score": 1.0,
+            "confidence": 1.0,
+            "source_coverage": 1.0,
+            "quality_weight": 0.5,
+        },
+        "news_features": {"score": 0.0},
+        "investment_debate_state": {"signal_score": 0.0},
+        "risk_debate_state": {"signal_score": 0.0},
+    }
+    score = engine.score(state)
+    assert score.sentiment == 0.5
+
+
+@pytest.mark.unit
+def test_quanta_alpha_miner_generates_selected_alpha():
+    miner = QuantaAlphaMiner()
+    result = miner.mine(
+        {
+            "market_features": {"score": 0.7, "confidence": 0.8},
+            "fundamentals_features": {"score": 0.4, "confidence": 0.7},
+            "sentiment_features": {"score": 0.2, "confidence": 0.6, "source_coverage": 0.5},
+            "news_features": {"score": 0.3, "confidence": 0.6},
+            "investment_debate_state": {"signal_score": 0.5},
+            "risk_debate_state": {"signal_score": 0.0},
+        }
+    )
+    assert result.selected_alpha is not None
+    assert result.candidates
+    assert result.signal_score > 0
+    assert result.summary
+    assert result.selected_alpha.name in result.summary
+
+
+@pytest.mark.unit
+def test_factor_engine_consumes_alpha_mining_result():
+    engine = FactorEngine()
+    state = {
+        "market_report": "",
+        "fundamentals_report": "",
+        "sentiment_report": "",
+        "news_report": "",
+        "market_features": {"score": 0.0},
+        "fundamentals_features": {"score": 0.0},
+        "sentiment_features": {"score": 0.0},
+        "news_features": {"score": 0.0},
+        "alpha_mining_result": {"signal_score": 0.8},
+        "investment_debate_state": {"signal_score": 0.0},
+        "risk_debate_state": {"signal_score": 0.0},
+    }
+    score = engine.score(state)
+    assert score.alpha == 0.8
+    assert score.composite_score > 0
+    assert "alpha=0.80" in score.summary
 
 
 @pytest.mark.unit

@@ -16,6 +16,7 @@ class TimeContext(BaseModel):
     as_of_date: str
     timezone: str = "America/New_York"
     market_session: str = "close"
+    analysis_lookback_days: int = 30
     created_at_utc: str = Field(default_factory=_utc_now_iso)
 
     @classmethod
@@ -25,6 +26,7 @@ class TimeContext(BaseModel):
         timezone_name: str = "America/New_York",
         market_session: str = "close",
         as_of_date: Optional[str] = None,
+        analysis_lookback_days: int = 30,
     ) -> "TimeContext":
         """Build a time context from a trading date."""
         resolved_date = as_of_date or str(trade_date)
@@ -33,15 +35,18 @@ class TimeContext(BaseModel):
             as_of_date=resolved_date,
             timezone=timezone_name,
             market_session=market_session,
+            analysis_lookback_days=analysis_lookback_days,
         )
 
-    def news_start_date(self, lookback_days: int = 7) -> str:
+    def news_start_date(self, lookback_days: Optional[int] = None) -> str:
         """Return the start date for a backward-looking news window."""
+        lookback_days = lookback_days or self.analysis_lookback_days
         start = datetime.strptime(self.as_of_date, "%Y-%m-%d") - timedelta(days=lookback_days)
         return start.strftime("%Y-%m-%d")
 
-    def price_start_date(self, lookback_days: int = 30) -> str:
+    def price_start_date(self, lookback_days: Optional[int] = None) -> str:
         """Return the start date for a backward-looking price window."""
+        lookback_days = lookback_days or self.analysis_lookback_days
         start = datetime.strptime(self.as_of_date, "%Y-%m-%d") - timedelta(days=lookback_days)
         return start.strftime("%Y-%m-%d")
 
@@ -68,4 +73,5 @@ def coerce_time_context(
         trade_date=str(trade_date),
         timezone_name=timezone_name,
         market_session=market_session,
+        analysis_lookback_days=30,
     )

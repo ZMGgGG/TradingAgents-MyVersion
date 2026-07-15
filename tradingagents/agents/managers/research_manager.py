@@ -10,6 +10,8 @@ from tradingagents.agents.schemas import (
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     build_compact_feature_context,
+    build_data_quality_context,
+    build_quant_summary_context,
     compact_history,
     get_language_instruction,
 )
@@ -25,6 +27,8 @@ def create_research_manager(llm):
     def research_manager_node(state) -> dict:
         instrument_context = build_instrument_context(state["company_of_interest"])
         feature_context = build_compact_feature_context(state)
+        data_quality_context = build_data_quality_context(state)
+        quant_context = build_quant_summary_context(state)
         history = state["investment_debate_state"].get("history", "")
         compact_debate_history = compact_history(history, keep_recent_lines=8)
         signal_summary = state["investment_debate_state"].get("signal_summary", "")
@@ -35,6 +39,8 @@ def create_research_manager(llm):
 
 {instrument_context}
 {feature_context}
+{data_quality_context}
+{quant_context}
 
 ---
 
@@ -54,6 +60,8 @@ Commit to a clear stance whenever the debate's strongest arguments warrant one; 
 
 **Structured Debate Summary:**
 {signal_summary}
+
+Do not restate both sides at length if they are repeating themselves. Focus on: the strongest differentiating arguments, quantified trade-offs, and at least one scenario comparison (base / upside / downside) when evidence allows.
 
 First write your natural-language decision memo. Then append a machine-readable summary block in exactly this format:
 

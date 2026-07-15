@@ -64,14 +64,18 @@ class AgentState(MessagesState):
     # research step
     market_report: Annotated[str, "Report from the Market Analyst"]
     market_features: Annotated[dict, "Structured features extracted from the Market Analyst report"]
+    market_evidence_ledger: Annotated[dict, "Structured evidence ledger extracted from market inputs"]
     sentiment_report: Annotated[str, "Report from the Sentiment Analyst"]
     sentiment_features: Annotated[dict, "Structured features extracted from the Sentiment Analyst report"]
+    sentiment_evidence_ledger: Annotated[dict, "Structured evidence ledger extracted from sentiment inputs"]
     news_report: Annotated[
         str, "Report from the News Researcher of current world affairs"
     ]
     news_features: Annotated[dict, "Structured features extracted from the News Analyst report"]
+    news_evidence_ledger: Annotated[dict, "Structured evidence ledger extracted from discovered news inputs"]
     fundamentals_report: Annotated[str, "Report from the Fundamentals Researcher"]
     fundamentals_features: Annotated[dict, "Structured features extracted from the Fundamentals Analyst report"]
+    fundamentals_evidence_ledger: Annotated[dict, "Structured evidence ledger extracted from fundamental inputs"]
 
     # researcher team discussion step
     investment_debate_state: Annotated[
@@ -89,6 +93,9 @@ class AgentState(MessagesState):
     past_context: Annotated[str, "Memory log context injected at run start (same-ticker decisions + cross-ticker lessons)"]
     time_context: Annotated[dict, "Unified time context used across the run"]
     data_snapshot: Annotated[dict, "Snapshot of the run inputs and outputs for replay"]
+    alpha_mining_result: Annotated[dict, "QuantaAlpha-style mined factor signal consumed by stage-two decisioning"]
+    alpha_experience_summary: Annotated[dict, "Summary of reusable alpha experience and cross-sample performance"]
     factor_score: Annotated[dict, "Deterministic multi-factor score used by stage-two decisioning"]
     position_sizing: Annotated[dict, "Deterministic position sizing plan"]
     risk_gate_result: Annotated[dict, "Deterministic hard risk gate decision"]
+    execution_plan: Annotated[dict, "Deterministic execution plan derived from final strategy outputs"]

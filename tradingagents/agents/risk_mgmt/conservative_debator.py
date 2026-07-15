@@ -6,6 +6,9 @@ from tradingagents.agents.schemas import (
 )
 from tradingagents.agents.utils.agent_utils import (
     build_compact_feature_context,
+    build_data_quality_context,
+    build_quant_summary_context,
+    build_report_evidence_pack,
     compact_history,
     get_language_instruction,
     get_time_context_instruction,
@@ -30,11 +33,13 @@ def create_conservative_debator(llm):
         current_neutral_response = risk_debate_state.get("current_neutral_response", "")
 
         first_round = risk_debate_state.get("count", 0) == 0
-        market_research_report = state["market_report"] if first_round else "[Use structured feature summary below; full market report omitted after round 1.]"
-        sentiment_report = state["sentiment_report"] if first_round else "[Use structured feature summary below; full sentiment report omitted after round 1.]"
-        news_report = state["news_report"] if first_round else "[Use structured feature summary below; full news report omitted after round 1.]"
-        fundamentals_report = state["fundamentals_report"] if first_round else "[Use structured feature summary below; full fundamentals report omitted after round 1.]"
+        market_research_report = build_report_evidence_pack(state, report_key="market_report", features_key="market_features", label="Market") if first_round else "[Use structured feature summary below; full market report omitted after round 1.]"
+        sentiment_report = build_report_evidence_pack(state, report_key="sentiment_report", features_key="sentiment_features", label="Sentiment") if first_round else "[Use structured feature summary below; full sentiment report omitted after round 1.]"
+        news_report = build_report_evidence_pack(state, report_key="news_report", features_key="news_features", label="News") if first_round else "[Use structured feature summary below; full news report omitted after round 1.]"
+        fundamentals_report = build_report_evidence_pack(state, report_key="fundamentals_report", features_key="fundamentals_features", label="Fundamentals") if first_round else "[Use structured feature summary below; full fundamentals report omitted after round 1.]"
         feature_context = build_compact_feature_context(state)
+        data_quality_context = build_data_quality_context(state)
+        quant_context = build_quant_summary_context(state)
 
         trader_decision = state["trader_investment_plan"]
 
@@ -45,6 +50,8 @@ def create_conservative_debator(llm):
 Your task is to actively counter the arguments of the Aggressive and Neutral Analysts, highlighting where their views may overlook potential threats or fail to prioritize sustainability. Respond directly to their points, drawing from the following data sources to build a convincing case for a low-risk approach adjustment to the trader's decision:
 
 {feature_context}
+{data_quality_context}
+{quant_context}
 
 Market Research Report: {market_research_report}
 Social Media Sentiment Report: {sentiment_report}
@@ -53,6 +60,8 @@ Company Fundamentals Report: {fundamentals_report}
 Here is the current conversation history: {compact_risk_history} Here is the last response from the aggressive analyst: {current_aggressive_response} Here is the last response from the neutral analyst: {current_neutral_response}. If there are no responses from the other viewpoints yet, present your own argument based on the available data.
 
 Engage by questioning their optimism and emphasizing the potential downsides they may have overlooked. Address each of their counterpoints to showcase why a conservative stance is ultimately the safest path for the firm's assets. Focus on debating and critiquing their arguments to demonstrate the strength of a low-risk strategy over their approaches.
+Avoid repeating points already covered unless you are adding a new number, a new downside scenario, or a clearer quantified trade-off.
+Keep the debate body concise: no more than 4 short paragraphs or bullets, under 900 Chinese characters or 450 English words. Do not restate full analyst reports; cite only the strongest evidence.
 First write your normal debate response in natural language. Then append a machine-readable summary block in exactly this format:
 
 STRUCTURED_SUMMARY
@@ -65,7 +74,7 @@ THESIS: <one concise thesis>
 GUARDRAILS: <main risk controls or defensive posture>
 END_STRUCTURED_SUMMARY
 
-Keep the debate body rich and persuasive. The summary block should be brief and only appear once at the end.
+Keep the summary block brief and only appear once at the end.
 {get_time_context_instruction(state)}""" + get_language_instruction()
 
         rendered_signal, signal = invoke_structured_or_freetext_result(

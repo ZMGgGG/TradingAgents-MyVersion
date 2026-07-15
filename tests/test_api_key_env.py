@@ -147,3 +147,27 @@ def test_ensure_api_key_updates_existing_env_file(monkeypatch, tmp_path, cli_uti
     assert "OPENAI_API_KEY" in content and "sk-existing" in content
     assert "OTHER=value" in content
     assert "OPENROUTER_API_KEY" in content and "sk-openrouter-new" in content
+
+
+def test_openai_compatible_client_prefers_explicit_api_key(monkeypatch):
+    """Task-local keys should not need process-wide environment mutation."""
+    from tradingagents.llm_clients import openai_client
+
+    captured = {}
+
+    class FakeChat:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.delenv("DASHSCOPE_CN_API_KEY", raising=False)
+    monkeypatch.setattr(openai_client, "NormalizedChatOpenAI", FakeChat)
+
+    client = openai_client.OpenAIClient(
+        "qwen3.6-flash",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        provider="qwen-cn",
+        api_key="sk-task-local",
+    )
+
+    assert client.get_llm() is not None
+    assert captured["api_key"] == "sk-task-local"

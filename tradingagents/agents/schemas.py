@@ -98,6 +98,21 @@ class AnalystFeatureSummary(BaseModel):
     risk_flag: str = Field(
         description="Primary risk caveat or degradation flag.",
     )
+    source_coverage: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Fraction of expected source coverage that was actually available.",
+    )
+    quality_flags: list[str] = Field(
+        default_factory=list,
+        description="Data quality issues or caveats attached to this feature summary.",
+    )
+    quality_weight: float = Field(
+        ge=0.0,
+        le=1.0,
+        default=1.0,
+        description="Normalized quality weight after applying data-quality penalties.",
+    )
 
 
 class InvestmentDebateSignal(BaseModel):
@@ -367,6 +382,28 @@ class PortfolioDecision(BaseModel):
     )
 
 
+class ExecutionPlan(BaseModel):
+    action: str = Field(description="Normalized execution action such as buy, hold, underweight, or sell.")
+    target_position_size: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Target portfolio weight to apply in backtests.",
+    )
+    holding_days: int = Field(
+        ge=1,
+        description="Planned holding period in days for scenario backtesting.",
+    )
+    risk_gate_approved: bool = Field(
+        description="Whether the deterministic risk gate approved execution.",
+    )
+    stop_loss_buffer: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Optional stop loss buffer used for execution planning.",
+    )
+
+
 def render_pm_decision(decision: PortfolioDecision) -> str:
     """Render a PortfolioDecision back to the markdown shape the rest of the system expects.
 
@@ -567,9 +604,20 @@ def parse_analyst_feature_summary(text: str) -> AnalystFeatureSummary:
     confidence = _parse_float(_extract_field(summary_text, "Confidence", "CONFIDENCE")) or 0.5
     key_signal = _extract_field(summary_text, "Key Signal", "KEY_SIGNAL") or "No structured key signal captured."
     risk_flag = _extract_field(summary_text, "Risk Flag", "RISK_FLAG") or "No structured risk flag captured."
+    source_coverage = _parse_float(_extract_field(summary_text, "Source Coverage", "SOURCE_COVERAGE")) or 1.0
+    quality_flags_raw = _extract_field(summary_text, "Quality Flags", "QUALITY_FLAGS") or ""
+    quality_flags = [
+        flag.strip()
+        for flag in re.split(r"[|,]", quality_flags_raw)
+        if flag.strip()
+    ]
+    quality_weight = _parse_float(_extract_field(summary_text, "Quality Weight", "QUALITY_WEIGHT")) or 1.0
     return AnalystFeatureSummary(
         score=max(-1.0, min(1.0, score)),
         confidence=max(0.0, min(1.0, confidence)),
         key_signal=key_signal,
         risk_flag=risk_flag,
+        source_coverage=max(0.0, min(1.0, source_coverage)),
+        quality_flags=quality_flags,
+        quality_weight=max(0.0, min(1.0, quality_weight)),
     )
