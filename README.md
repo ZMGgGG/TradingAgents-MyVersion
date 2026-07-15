@@ -7,6 +7,7 @@
 ## 当前版本做了什么
 
 - 新增 Web Workbench：提供登录、任务创建、历史任务、执行编排、Agent 输出、报告预览、日志、回测和评估结果查看。
+- 新增多用户系统：支持用户注册/登录、滑块验证、会话 Cookie、管理员用户管理、用户级任务历史与运行缓存隔离。
 - 新增 Factor Manager：在 Research Manager 之后、Trader 之前运行，读取因子库和 Alpha Mining 经验，生成 `factor_score` 参与交易计划前的决策输入。
 - 新增 Alpha Mining：支持候选因子生成、变异、评估、历史沉淀和经验摘要。
 - 新增报告评估：支持参考报告、HTML/PDF 文本抽取和报告质量评估。
@@ -16,6 +17,16 @@
 - 优化执行策略：Hold 决策不会再产生默认仓位，仓位逻辑集中到执行策略层处理。
 - 优化前端体验：参考 Tabler 风格整理工作台布局、统一字体、简化执行编排视图，并修复 Factor Manager 实时输出展示。
 - 优化 Docker 部署：增加 `tradingagents-workbench` 服务，方便直接启动 Web 操作台。
+
+## 页面截图
+
+登录页包含注册/登录切换、密码校验和滑块验证：
+
+![Workbench 登录页](assets/readme/workbench-login.png)
+
+登录后的 Workbench 主界面包含用户信息、执行槽、任务配置、导航和运行状态：
+
+![Workbench 主界面](assets/readme/workbench-dashboard.png)
 
 ## 执行流程
 
@@ -129,6 +140,17 @@ docker compose --profile ollama run --rm tradingagents-ollama
 - `.tradingagents/` 运行缓存和历史
 - 本地报告、研报和临时研究材料
 - 个人内网地址或代理地址
+
+## 多用户系统
+
+Workbench 内置轻量多用户系统，主要用于多人共用同一套部署时隔离任务和历史数据。
+
+- 注册/登录：支持用户名密码注册和登录，密码使用 PBKDF2 哈希后存储。
+- 滑块验证：登录和注册前需要完成滑块验证，避免简单脚本直接撞库。
+- 会话管理：登录后通过 HttpOnly Cookie 维持会话，服务端记录会话过期时间。
+- 管理员角色：首个注册用户会成为管理员，管理员可查看用户列表、禁用/解锁用户、重置密码和删除用户。
+- 用户隔离：不同用户的任务历史、报告路径、缓存和 Workbench 运行数据按 `user_id` 命名空间隔离。
+- 登录保护：连续失败会触发短时间锁定，降低暴力尝试风险。
 
 ## Workbench 说明
 
