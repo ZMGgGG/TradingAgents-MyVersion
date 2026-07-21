@@ -11,6 +11,11 @@ _OPENAI_COMPATIBLE = (
     "ollama", "openrouter",
 )
 
+_PROVIDER_ALIASES = {
+    # Backward-compatible name used by older local configs for Qwen China.
+    "dashscope": "qwen-cn",
+}
+
 
 def create_llm_client(
     provider: str,
@@ -36,7 +41,7 @@ def create_llm_client(
     Raises:
         ValueError: If provider is not supported
     """
-    provider_lower = provider.lower()
+    provider_lower = _PROVIDER_ALIASES.get(provider.lower(), provider.lower())
 
     if provider_lower in _OPENAI_COMPATIBLE:
         from .openai_client import OpenAIClient

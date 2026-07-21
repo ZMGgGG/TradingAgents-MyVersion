@@ -1,7 +1,53 @@
-const { createApp, computed, onMounted, reactive, ref, watch } = Vue;
+const { createApp, computed, onMounted, onUnmounted, reactive, ref, watch } = Vue;
 
 createApp({
   setup() {
+    function padTimePart(value) {
+      return String(value).padStart(2, "0");
+    }
+
+    function localDateInputValue(date = new Date()) {
+      return [
+        date.getFullYear(),
+        padTimePart(date.getMonth() + 1),
+        padTimePart(date.getDate()),
+      ].join("-");
+    }
+
+    function localTimestamp(date = new Date()) {
+      const offsetMinutes = -date.getTimezoneOffset();
+      const sign = offsetMinutes >= 0 ? "+" : "-";
+      const absoluteOffset = Math.abs(offsetMinutes);
+      return [
+        `${localDateInputValue(date)}T${padTimePart(date.getHours())}:${padTimePart(date.getMinutes())}:${padTimePart(date.getSeconds())}`,
+        `${sign}${padTimePart(Math.floor(absoluteOffset / 60))}:${padTimePart(absoluteOffset % 60)}`,
+      ].join("");
+    }
+
+    function parseDateTime(value) {
+      if (!value) {
+        return null;
+      }
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? null : date;
+    }
+
+    function formatLocalDateTime(value) {
+      const date = parseDateTime(value);
+      if (!date) {
+        return value ? String(value) : "";
+      }
+      return `${localDateInputValue(date)} ${padTimePart(date.getHours())}:${padTimePart(date.getMinutes())}:${padTimePart(date.getSeconds())}`;
+    }
+
+    function formatLocalTime(value) {
+      const date = parseDateTime(value);
+      if (!date) {
+        return value ? String(value).slice(11, 19) : "--:--:--";
+      }
+      return `${padTimePart(date.getHours())}:${padTimePart(date.getMinutes())}:${padTimePart(date.getSeconds())}`;
+    }
+
     const analysts = [
       { label: "Market Analyst", value: "market" },
       { label: "Sentiment Analyst", value: "social" },
@@ -141,7 +187,7 @@ createApp({
     const form = reactive({
       ticker: "BTC-USD",
       assetType: "crypto",
-      analysisDate: "2026-06-01",
+      analysisDate: localDateInputValue(),
       analysisLookbackDays: 14,
       outputLanguage: "Chinese",
       customLanguage: "",
@@ -257,6 +303,10 @@ createApp({
       backtestEnabled: false,
       backtestSummary: "",
       backtestDetail: [],
+      paperTradingEnabled: false,
+      paperTradingSummary: "",
+      paperTradingDetail: [],
+      paperTradingConfig: {},
       alphaMiningEnabled: false,
       alphaMiningSummary: "",
       alphaMiningDetail: null,
@@ -276,6 +326,64 @@ createApp({
     const showAllHistory = ref(false);
     const selectedTaskRunId = ref("");
     const selectedBacktestView = ref("overview");
+    const selectedPaperTradingView = ref("overview");
+    const paperWorkbenchModuleIds = ["paper", "paper-future", "paper-replay"];
+    const isPaperWorkbenchModule = computed(() => paperWorkbenchModuleIds.includes(activeWorkbenchModule.value));
+    const isPaperFutureModule = computed(() => activeWorkbenchModule.value === "paper-future");
+    const isPaperAccountModule = computed(() => activeWorkbenchModule.value === "paper");
+    const isPaperReplayModule = computed(() => activeWorkbenchModule.value === "paper-replay");
+    const paperModuleTitle = computed(() => {
+      if (isPaperReplayModule.value) return "历史回测";
+      if (isPaperAccountModule.value) return "纸面账户";
+      return "推演模拟盘";
+    });
+    const paperModuleDescription = computed(() => (
+      isPaperReplayModule.value
+        ? "手动选择历史结论或录入历史假设，用结论日期之后的真实价格回放兑现路径。"
+        : (isPaperAccountModule.value
+          ? "用虚拟资金按真实入场机会执行，维护现金、持仓、成交和权益曲线。"
+          : "按选定起点运行模拟盘；有真实后续行情就结算，没有就进入进行中推演。")
+    ));
+    const paperInterfaceTitle = computed(() => {
+      if (isPaperReplayModule.value) return "历史回测输入";
+      if (isPaperAccountModule.value) return "纸面账户下单";
+      return "运行推演模拟盘";
+    });
+    const paperInterfaceDescription = computed(() => (
+      isPaperReplayModule.value
+        ? "选择过去的 execution_plan 或手动输入历史结论，只回放历史结果，不影响实时模拟账户。"
+        : (isPaperAccountModule.value
+          ? "选择最新 execution_plan 或手动录入假设后写入纸面账户。"
+          : "手动选择起点、入场价和仓位运行模拟盘；可选同步为纸面账户执行。")
+    ));
+    const paperMode = computed(() => {
+      if (activeWorkbenchModule.value === "paper-replay") {
+        return "replay";
+      }
+      if (activeWorkbenchModule.value === "paper-future") {
+        return "future";
+      }
+      return "";
+    });
+    const paperChartOptions = [
+      { key: "equity", label: "账户权益", decimals: 2 },
+      { key: "cash", label: "现金", decimals: 2 },
+      { key: "positionsValue", label: "持仓市值", decimals: 2 },
+      { key: "price", label: "标的价格", decimals: 4 },
+    ];
+    const backtestChartOptions = [
+      { key: "equity", label: "回测权益", decimals: 2 },
+      { key: "price", label: "回测期真实价格", decimals: 4 },
+    ];
+    const observationChartOptions = [
+      { key: "intradayPrice", label: "当日实时价格", decimals: 4 },
+    ];
+    const observationReturnChartOptions = [
+      { key: "assetReturn", label: "真实标的收益", decimals: 4 },
+      { key: "strategyReturn", label: "推演策略收益", decimals: 4 },
+      { key: "paperReturn", label: "纸面账户收益", decimals: 4 },
+      { key: "backtestReturn", label: "历史回测收益", decimals: 4 },
+    ];
     const selectedAlphaView = ref("selected");
     const showAllAlphaHistory = ref(false);
     const showAllAlphaRegistry = ref(false);
@@ -284,6 +392,88 @@ createApp({
       loading: false,
       error: "",
       data: null,
+    });
+    const paper = reactive({
+      ticker: "BTC-USD",
+      assetType: "crypto",
+      quote: null,
+      quoteHistory: [],
+      account: null,
+      analytics: null,
+      episodes: null,
+      analyticsSkills: [],
+      selectedAnalyticsSkills: {},
+      signals: [],
+      selectedSignalRunId: "",
+      selectedReplaySignalRunId: "",
+      action: "buy",
+      targetPositionSize: "0.10",
+      executePaperAccount: false,
+      forecastAnalysisDate: localDateInputValue(),
+      forecastEntryPrice: "",
+      simulationScenario: "base",
+      simulationDrift: "",
+      simulationVolatility: "",
+      simulationSeed: "",
+      simulationPaths: "200",
+      commissionRate: "0",
+      slippageRate: "0",
+      initialCash: "100000",
+      horizonDays: "20",
+      conclusionThesis: "",
+      replayAction: "buy",
+      replayTargetPositionSize: "0.10",
+      replayHorizonDays: "20",
+      replayThesis: "",
+      replayAccount: null,
+      replayAnalytics: null,
+      replayResult: null,
+      forecastResult: null,
+      replayLastUpdated: "",
+      replayTicker: "BTC-USD",
+      replayTradeDate: "",
+      ledgerLastUpdated: "",
+      chartFullscreen: false,
+      chartHover: null,
+      chartRange: "7d",
+      chartStartDate: "",
+      chartEndDate: "",
+      chartSeries: {
+        equity: true,
+        cash: false,
+        positionsValue: false,
+        price: true,
+      },
+      autoRefresh: true,
+      loading: false,
+      error: "",
+      lastUpdated: "",
+    });
+    const conclusions = reactive({
+      items: [],
+      summary: {},
+      loading: false,
+      error: "",
+      selectedConclusionId: "",
+      reviewNotes: {},
+      quote: null,
+      intradayRows: [],
+      quoteLastUpdated: "",
+      quoteLoading: false,
+      chartHover: null,
+      chartRange: "all",
+      chartStartDate: "",
+      chartEndDate: "",
+      lifecycleLastUpdated: "",
+      form: {
+        ticker: "",
+        assetType: "stock",
+        thesis: "",
+        rating: "Manual",
+        action: "hold",
+        targetPositionSize: "0",
+        horizonDays: "20",
+      },
     });
     const checkpointState = reactive({
       enabled: false,
@@ -320,6 +510,7 @@ createApp({
       "Portfolio Management": "组合管理",
     };
     const statusLabels = {
+      idle: "未开始",
       pending: "等待中",
       in_progress: "运行中",
       completed: "已完成",
@@ -569,6 +760,10 @@ createApp({
           backtest_enabled: attachments.backtestEnabled,
           backtest_summary: attachments.backtestSummary,
           backtest_detail: attachments.backtestDetail,
+          paper_trading_enabled: attachments.paperTradingEnabled,
+          paper_trading_summary: attachments.paperTradingSummary,
+          paper_trading_detail: attachments.paperTradingDetail,
+          paper_trading_config: attachments.paperTradingConfig,
           alpha_mining_enabled: attachments.alphaMiningEnabled,
           alpha_mining_summary: attachments.alphaMiningSummary,
           alpha_mining_detail: attachments.alphaMiningDetail,
@@ -602,6 +797,677 @@ createApp({
       const detail = (selectedTaskView.value.attachments || {}).backtest_detail;
       return Array.isArray(detail) ? detail : [];
     });
+
+    const selectedPaperSnapshots = computed(() => {
+      const snapshots = paper.account?.snapshots;
+      return Array.isArray(snapshots) ? snapshots : [];
+    });
+    const selectedReplaySnapshots = computed(() => {
+      const snapshots = paper.replayAccount?.snapshots;
+      return Array.isArray(snapshots) ? snapshots : [];
+    });
+    const currentPaperSignals = computed(() => paper.signals.filter((signal) => !isHistoricalPaperSignal(signal)));
+    const historicalPaperSignals = computed(() => paper.signals.filter((signal) => isHistoricalPaperSignal(signal)));
+
+    const paperPositions = computed(() => Object.values(paper.account?.positions || {}));
+    const paperFills = computed(() => Array.isArray(paper.account?.fills) ? paper.account.fills.slice().reverse() : []);
+    const paperConclusionTracks = computed(() => {
+      if (Array.isArray(paper.analytics?.tracks) && paper.analytics.tracks.length) {
+        return paper.analytics.tracks;
+      }
+      const positions = paper.account?.positions || {};
+      const seen = new Set();
+      return paperFills.value
+        .filter((fill) => {
+          const key = `${fill.source_run_id || ""}:${fill.ticker || ""}:${fill.trade_date || ""}:${fill.side || ""}`;
+          if (seen.has(key) || fill.side === "sell") {
+            return false;
+          }
+          seen.add(key);
+          return true;
+        })
+        .map((fill) => {
+          const position = positions[fill.ticker] || {};
+          const entryPrice = Number(fill.price) || 0;
+          const lastPrice = Number(position.last_price) || Number(paper.quote?.price) || entryPrice;
+          const openedAt = new Date(fill.trade_date);
+          const ageDays = Number.isNaN(openedAt.getTime())
+            ? 0
+            : Math.max(0, Math.floor((Date.now() - openedAt.getTime()) / 86400000));
+          const horizonDays = Number(fill.horizon_days) || 20;
+          return {
+            ...fill,
+            age_days: ageDays,
+            horizon_days: horizonDays,
+            progress: Math.min(1, ageDays / horizonDays),
+            current_return: entryPrice ? (lastPrice / entryPrice) - 1 : 0,
+            status: ageDays >= horizonDays ? "待复盘" : "跟踪中",
+          };
+        })
+        .slice(0, 20);
+    });
+
+    function buildSeriesChart(dataSources, options, { axisPreference = "price", xLabelFormatter = null } = {}) {
+      const width = 700;
+      const height = 280;
+      const padLeft = 118;
+      const padRight = 50;
+      const padTop = 26;
+      const padBottom = 42;
+      const series = options
+        .map((option) => {
+          const source = dataSources[option.key] || { values: [], dates: [] };
+          const sourceValues = source.values || [];
+          const rawValues = sourceValues.map((value, index) => ({
+            index,
+            value,
+          })).filter((item) => Number.isFinite(item.value));
+          if (!rawValues.length) {
+            return null;
+          }
+          const values = rawValues.map((item) => item.value);
+          const min = Math.min(...values);
+          const max = Math.max(...values);
+          const spread = max - min || Math.max(1, Math.abs(max) * 0.01);
+          const pointItems = rawValues.map((item) => {
+            const x = sourceValues.length === 1 ? width / 2 : padLeft + (item.index * (width - padLeft - padRight)) / (sourceValues.length - 1);
+            const y = height - padBottom - ((item.value - min) / spread) * (height - padTop - padBottom);
+            return {
+              x,
+              y,
+              value: item.value,
+              date: source.dates?.[item.index] || "",
+              index: item.index,
+            };
+          });
+          return {
+            ...option,
+            points: pointItems.map((item) => `${item.x.toFixed(2)},${item.y.toFixed(2)}`).join(" "),
+            pointItems,
+            min,
+            max,
+            latest: values[values.length - 1],
+            dates: source.dates || [],
+          };
+        })
+        .filter(Boolean);
+      const axisSeries = series.find((item) => item.key === axisPreference) || series[0] || null;
+      const dates = axisSeries?.dates || [];
+      const cleanDate = (value) => (typeof xLabelFormatter === "function" ? xLabelFormatter(value) : String(value || "").slice(0, 10));
+      const xLabels = dates.length ? [
+        { x: padLeft, label: cleanDate(dates[0]), anchor: "start" },
+        { x: width / 2, label: cleanDate(dates[Math.floor((dates.length - 1) / 2)]), anchor: "middle" },
+        { x: width - padRight, label: cleanDate(dates[dates.length - 1]), anchor: "end" },
+      ] : [];
+      const yTicks = axisSeries ? [
+        { y: padTop, value: axisSeries.max, label: formatNumber(axisSeries.max, axisSeries.decimals) },
+        { y: height - padBottom - ((axisSeries.max + axisSeries.min) / 2 - axisSeries.min) / ((axisSeries.max - axisSeries.min) || Math.max(1, Math.abs(axisSeries.max) * 0.01)) * (height - padTop - padBottom), value: (axisSeries.max + axisSeries.min) / 2, label: formatNumber((axisSeries.max + axisSeries.min) / 2, axisSeries.decimals) },
+        { y: height - padBottom, value: axisSeries.min, label: formatNumber(axisSeries.min, axisSeries.decimals) },
+      ] : [];
+      return {
+        series,
+        axis: {
+          x1: padLeft,
+          x2: width - padRight,
+          y1: padTop,
+          y2: height - padBottom,
+          label: axisSeries?.label || "",
+          decimals: axisSeries?.decimals || 2,
+          xLabels,
+          yTicks,
+        },
+      };
+    }
+
+    function buildQuantileBandChart(rows) {
+      const width = 700;
+      const height = 280;
+      const padLeft = 118;
+      const padRight = 50;
+      const padTop = 26;
+      const padBottom = 42;
+      const cleanRows = (Array.isArray(rows) ? rows : [])
+        .map((item, index) => ({
+          index,
+          date: item.date,
+          p10: Number(item.p10),
+          p50: Number(item.p50),
+          p90: Number(item.p90),
+        }))
+        .filter((item) => Number.isFinite(item.p10) && Number.isFinite(item.p50) && Number.isFinite(item.p90));
+      if (!cleanRows.length) {
+        return {
+          series: [],
+          axis: {
+            x1: padLeft,
+            x2: width - padRight,
+            y1: padTop,
+            y2: height - padBottom,
+            label: "推演价格",
+            decimals: 4,
+            xLabels: [],
+            yTicks: [],
+          },
+          bandPoints: "",
+          lowerPoints: "",
+          upperPoints: "",
+        };
+      }
+      const values = cleanRows.flatMap((item) => [item.p10, item.p50, item.p90]);
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const spread = max - min || Math.max(1, Math.abs(max) * 0.01);
+      const xForIndex = (index) => cleanRows.length === 1
+        ? width / 2
+        : padLeft + (index * (width - padLeft - padRight)) / (cleanRows.length - 1);
+      const yForValue = (value) => height - padBottom - ((value - min) / spread) * (height - padTop - padBottom);
+      const pointItems = cleanRows.map((item, index) => ({
+        x: xForIndex(index),
+        y: yForValue(item.p50),
+        value: item.p50,
+        date: item.date,
+        index,
+      }));
+      const lower = cleanRows.map((item, index) => ({ x: xForIndex(index), y: yForValue(item.p10) }));
+      const upper = cleanRows.map((item, index) => ({ x: xForIndex(index), y: yForValue(item.p90) }));
+      const toPoints = (items) => items.map((item) => `${item.x.toFixed(2)},${item.y.toFixed(2)}`).join(" ");
+      const xLabels = [
+        { x: padLeft, label: String(cleanRows[0].date || "").slice(0, 10), anchor: "start" },
+        { x: width / 2, label: String(cleanRows[Math.floor((cleanRows.length - 1) / 2)].date || "").slice(0, 10), anchor: "middle" },
+        { x: width - padRight, label: String(cleanRows[cleanRows.length - 1].date || "").slice(0, 10), anchor: "end" },
+      ];
+      const yTicks = [
+        { y: padTop, value: max, label: formatNumber(max, 4) },
+        { y: height - padBottom - (((max + min) / 2 - min) / spread) * (height - padTop - padBottom), value: (max + min) / 2, label: formatNumber((max + min) / 2, 4) },
+        { y: height - padBottom, value: min, label: formatNumber(min, 4) },
+      ];
+      return {
+        series: [{
+          key: "simulationMedian",
+          label: "中位 P50",
+          decimals: 4,
+          points: toPoints(pointItems),
+          pointItems,
+          latest: cleanRows[cleanRows.length - 1].p50,
+          min,
+          max,
+        }],
+        axis: {
+          x1: padLeft,
+          x2: width - padRight,
+          y1: padTop,
+          y2: height - padBottom,
+          label: "推演价格",
+          decimals: 4,
+          xLabels,
+          yTicks,
+        },
+        bandPoints: `${toPoints(upper)} ${toPoints(lower.slice().reverse())}`,
+        lowerPoints: toPoints(lower),
+        upperPoints: toPoints(upper),
+      };
+    }
+
+    const paperChart = computed(() => {
+      const snapshots = filterRowsByDateRange(
+        selectedPaperSnapshots.value.filter((item) => item && typeof item === "object"),
+        paper.chartRange,
+        paper.chartStartDate,
+        paper.chartEndDate,
+        "trade_date",
+      );
+      const ticker = String(paper.ticker || "").toUpperCase();
+      const marketTicker = String(paper.quote?.market_ticker || ticker).toUpperCase();
+      const savedHistory = (paper.account?.market_history || {})[marketTicker] || [];
+      const quoteHistoryRows = Array.isArray(paper.quote?.history) ? paper.quote.history : [];
+      const quoteHistory = Array.isArray(paper.quoteHistory)
+        ? paper.quoteHistory.filter((item) => item && item.ticker === ticker)
+        : [];
+      const intradayPriceRows = Array.isArray(paper.quote?.intraday)
+        ? paper.quote.intraday
+          .map((item) => ({
+            value: Number(item.price ?? item.close ?? item.Close),
+            date: item.time || item.as_of || item.timestamp || item.datetime,
+          }))
+          .filter((item) => Number.isFinite(item.value) && dateOnly(item.date) === localDateInputValue())
+        : [];
+      const priceRows = paper.chartRange === "today" && intradayPriceRows.length
+        ? intradayPriceRows
+        : (Array.isArray(savedHistory) && savedHistory.length
+          ? savedHistory.map((item) => ({ value: Number(item.close), date: item.date }))
+          : (quoteHistoryRows.length
+            ? quoteHistoryRows.map((item) => ({ value: Number(item.close), date: item.date }))
+            : quoteHistory.map((item) => ({ value: Number(item.price), date: item.as_of }))));
+      const latestQuotePrice = Number(paper.quote?.price);
+      if (Number.isFinite(latestQuotePrice)) {
+        const latestQuoteDate = normalizeLiveQuoteTime(paper.quote?.as_of);
+        const lastPriceRow = priceRows[priceRows.length - 1];
+        if (!lastPriceRow || lastPriceRow.date !== latestQuoteDate || Number(lastPriceRow.value) !== latestQuotePrice) {
+          priceRows.push({ value: latestQuotePrice, date: latestQuoteDate });
+        }
+      }
+      const snapshotDates = snapshots.map((item) => item.trade_date);
+      const filteredPriceRows = filterRowsByDateRange(
+        priceRows,
+        paper.chartRange,
+        paper.chartStartDate,
+        paper.chartEndDate,
+        "date",
+      );
+      const dataSources = {
+        equity: { values: snapshots.map((item) => Number(item.equity)), dates: snapshotDates },
+        cash: { values: snapshots.map((item) => Number(item.cash)), dates: snapshotDates },
+        positionsValue: { values: snapshots.map((item) => Number(item.positions_value)), dates: snapshotDates },
+        price: { values: filteredPriceRows.map((item) => item.value), dates: filteredPriceRows.map((item) => item.date) },
+      };
+      return {
+        ...buildSeriesChart(
+          dataSources,
+          paperChartOptions.filter((option) => paper.chartSeries[option.key]),
+          {
+            axisPreference: "price",
+            xLabelFormatter: paper.chartRange === "today" ? formatChartTimeLabel : null,
+          },
+        ),
+        latest: snapshots[snapshots.length - 1],
+      };
+    });
+
+    const backtestChart = computed(() => {
+      const snapshots = selectedReplaySnapshots.value.filter((item) => item && typeof item === "object");
+      const ticker = String(paper.replayTicker || paper.ticker || "").toUpperCase();
+      const priceRows = snapshots
+        .map((snapshot) => {
+          const positions = snapshot.positions || {};
+          const position = positions[ticker] || Object.values(positions)[0] || {};
+          return {
+            value: Number(position.last_price),
+            date: snapshot.trade_date,
+          };
+        })
+        .filter((item) => Number.isFinite(item.value));
+      return buildSeriesChart(
+        {
+          equity: { values: snapshots.map((item) => Number(item.equity)), dates: snapshots.map((item) => item.trade_date) },
+          price: { values: priceRows.map((item) => item.value), dates: priceRows.map((item) => item.date) },
+        },
+        backtestChartOptions,
+        { axisPreference: "price" },
+      );
+    });
+
+    const selectedConclusionTrack = computed(() => {
+      return conclusions.items.find((item) => item.conclusion_id === conclusions.selectedConclusionId) || conclusions.items[0] || null;
+    });
+
+    const observationTicker = computed(() => {
+      return String(selectedConclusionTrack.value?.ticker || conclusions.form.ticker || form.ticker || "").trim().toUpperCase();
+    });
+
+    function formatChartTimeLabel(value) {
+      const date = parseDateTime(value);
+      if (!date) {
+        const text = String(value || "");
+        return text.includes("T") ? text.slice(11, 19) : text;
+      }
+      return `${padTimePart(date.getHours())}:${padTimePart(date.getMinutes())}:${padTimePart(date.getSeconds())}`;
+    }
+
+    function formatChartHoverLabel(value) {
+      const raw = String(value || "");
+      const date = parseDateTime(value);
+      if (!date) {
+        return raw || "N/A";
+      }
+      if (raw.includes("T") || raw.includes(":")) {
+        return formatLocalDateTime(value);
+      }
+      return localDateInputValue(date);
+    }
+
+    function normalizeLiveQuoteTime(value) {
+      const raw = String(value || "");
+      return raw.includes("T") || raw.includes(":") ? raw : localTimestamp();
+    }
+
+    function dateOnly(value) {
+      const text = String(value || "");
+      if (/^\d{4}-\d{2}-\d{2}/.test(text)) {
+        return text.slice(0, 10);
+      }
+      const date = parseDateTime(value);
+      return date ? localDateInputValue(date) : "";
+    }
+
+    function rangeBounds(range, startDate = "", endDate = "") {
+      const today = localDateInputValue();
+      if (range === "today") {
+        return { start: today, end: today };
+      }
+      if (range === "7d" || range === "30d") {
+        const days = range === "7d" ? 6 : 29;
+        const start = new Date();
+        start.setDate(start.getDate() - days);
+        return { start: localDateInputValue(start), end: today };
+      }
+      if (range === "custom") {
+        return { start: startDate || "", end: endDate || "" };
+      }
+      return { start: "", end: "" };
+    }
+
+    function filterRowsByDateRange(rows, range, startDate = "", endDate = "", dateKey = "date") {
+      const sourceRows = Array.isArray(rows) ? rows : [];
+      if (range === "today") {
+        const datedRows = sourceRows
+          .map((row) => ({ row, rowDate: dateOnly(row?.[dateKey]) }))
+          .filter((item) => item.rowDate);
+        const today = localDateInputValue();
+        const todayRows = datedRows.filter((item) => item.rowDate === today).map((item) => item.row);
+        if (todayRows.length) {
+          return todayRows;
+        }
+        const latestDate = datedRows.map((item) => item.rowDate).sort().pop();
+        return latestDate
+          ? datedRows.filter((item) => item.rowDate === latestDate).map((item) => item.row)
+          : [];
+      }
+      const bounds = rangeBounds(range, startDate, endDate);
+      if (!bounds.start && !bounds.end) {
+        return rows;
+      }
+      return sourceRows.filter((row) => {
+        const rowDate = dateOnly(row?.[dateKey]);
+        if (!rowDate) {
+          return false;
+        }
+        if (bounds.start && rowDate < bounds.start) {
+          return false;
+        }
+        if (bounds.end && rowDate > bounds.end) {
+          return false;
+        }
+        return true;
+      });
+    }
+
+    function weightedStrategyReturn(action, targetPositionSize, assetReturn) {
+      const normalizedAction = String(action || "").trim().toLowerCase();
+      const direction = ["buy", "overweight", "long", "strong_buy", "accumulate"].includes(normalizedAction)
+        ? 1
+        : (["sell", "underweight", "short", "strong_sell", "reduce"].includes(normalizedAction) ? -1 : 0);
+      const size = Math.max(0, Math.min(1, Number(targetPositionSize) || 0));
+      return direction * size * (Number(assetReturn) || 0);
+    }
+
+    const observationIntradayChart = computed(() => {
+      const rows = Array.isArray(conclusions.intradayRows) ? conclusions.intradayRows : [];
+      return buildSeriesChart(
+        {
+          intradayPrice: { values: rows.map((item) => Number(item.price)), dates: rows.map((item) => item.time || item.as_of) },
+        },
+        observationChartOptions,
+        { axisPreference: "intradayPrice", xLabelFormatter: formatChartTimeLabel },
+      );
+    });
+
+    const observationReturnChart = computed(() => {
+      const track = selectedConclusionTrack.value || {};
+      const simulations = Array.isArray(track.simulations) ? track.simulations : [];
+      const forecast = simulations.find((item) => item.simulation_type === "forecast") || track.comparison || {};
+      const paperTrade = simulations.find((item) => item.simulation_type === "paper_trade") || {};
+      const backtest = simulations.find((item) => item.simulation_type === "backtest") || {};
+      const rawForecastRows = Array.isArray(forecast.series) ? forecast.series.slice() : [];
+      const liveQuotePrice = Number(conclusions.quote?.price);
+      const entryPrice = Number(track.entry_price || forecast.entry_price);
+      const liveAction = track.action || forecast.action;
+      const liveTargetSize = track.target_position_size ?? forecast.target_position_size;
+      if (Number.isFinite(liveQuotePrice) && Number.isFinite(entryPrice) && entryPrice > 0) {
+        const today = localDateInputValue();
+        const intradayReturnRows = conclusions.chartRange === "today"
+          ? (Array.isArray(conclusions.intradayRows) ? conclusions.intradayRows : [])
+            .map((row) => {
+              const price = Number(row?.price);
+              const timestamp = row?.time || row?.as_of || conclusions.quote?.as_of || localTimestamp();
+              if (!Number.isFinite(price) || dateOnly(timestamp) !== today) {
+                return null;
+              }
+              const assetReturn = (price / entryPrice) - 1;
+              return {
+                date: timestamp,
+                price,
+                asset_return: assetReturn,
+                strategy_return: weightedStrategyReturn(liveAction, liveTargetSize, assetReturn),
+                price_source: "live_intraday",
+                covered_by_real: true,
+              };
+            })
+            .filter(Boolean)
+          : [];
+        const liveRows = conclusions.chartRange === "today" && intradayReturnRows.length
+          ? intradayReturnRows
+          : (() => {
+            const timestamp = dateOnly(conclusions.quote?.as_of) || today;
+            const assetReturn = (liveQuotePrice / entryPrice) - 1;
+            return [{
+              date: timestamp,
+              price: liveQuotePrice,
+              asset_return: assetReturn,
+              strategy_return: weightedStrategyReturn(liveAction, liveTargetSize, assetReturn),
+              price_source: "live_quote",
+              covered_by_real: true,
+            }];
+          })();
+        const liveDates = new Set(liveRows.map((row) => dateOnly(row.date)).filter(Boolean));
+        for (let index = rawForecastRows.length - 1; index >= 0; index -= 1) {
+          if (liveDates.has(dateOnly(rawForecastRows[index]?.date))) {
+            rawForecastRows.splice(index, 1);
+          }
+        }
+        rawForecastRows.push(...liveRows);
+        rawForecastRows.sort((left, right) => String(left.date || "").localeCompare(String(right.date || "")));
+      }
+      const forecastRows = filterRowsByDateRange(
+        rawForecastRows,
+        conclusions.chartRange,
+        conclusions.chartStartDate,
+        conclusions.chartEndDate,
+        "date",
+      );
+      const fallbackDate = track.analysis_date || String(track.opened_at || "").slice(0, 10) || localDateInputValue();
+      const fallbackCurrentDate = localDateInputValue();
+      const terminalRows = (item) => {
+        const finalReturn = Number(item.final_return ?? item.strategy_return ?? item.asset_return);
+        if (!Number.isFinite(finalReturn)) {
+          return [];
+        }
+        return [
+          { date: fallbackDate, value: 0 },
+          { date: fallbackCurrentDate, value: finalReturn },
+        ];
+      };
+      const paperRows = filterRowsByDateRange(
+        terminalRows(paperTrade),
+        conclusions.chartRange,
+        conclusions.chartStartDate,
+        conclusions.chartEndDate,
+        "date",
+      );
+      const backtestRows = filterRowsByDateRange(
+        terminalRows(backtest),
+        conclusions.chartRange,
+        conclusions.chartStartDate,
+        conclusions.chartEndDate,
+        "date",
+      );
+      return buildSeriesChart(
+        {
+          assetReturn: { values: forecastRows.map((item) => Number(item.asset_return)), dates: forecastRows.map((item) => item.date) },
+          strategyReturn: { values: forecastRows.map((item) => Number(item.strategy_return)), dates: forecastRows.map((item) => item.date) },
+          paperReturn: { values: paperRows.map((item) => item.value), dates: paperRows.map((item) => item.date) },
+          backtestReturn: { values: backtestRows.map((item) => item.value), dates: backtestRows.map((item) => item.date) },
+        },
+        observationReturnChartOptions,
+        {
+          axisPreference: forecastRows.length ? "assetReturn" : "strategyReturn",
+          xLabelFormatter: conclusions.chartRange === "today" ? formatChartTimeLabel : null,
+        },
+      );
+    });
+
+    function currentSimulationSummary() {
+      const episode = paper.forecastResult?.episode || {};
+      const meta = episode.tags?.simulation_config || episode.simulation || {};
+      return episode.tags?.simulation_summary || meta?.scenario_summary || {};
+    }
+
+    const forecastSimulationChart = computed(() => buildQuantileBandChart(currentSimulationSummary().series || []));
+
+    const activePaperChart = computed(() => {
+      if (isPaperReplayModule.value) return backtestChart.value;
+      if (isPaperFutureModule.value) return forecastSimulationChart.value;
+      return paperChart.value;
+    });
+    const paperChartTitle = computed(() => {
+      if (isPaperReplayModule.value) return "历史回测曲线";
+      if (isPaperAccountModule.value) return "纸面账户权益 / 价格曲线";
+      return "推演模拟盘参考价格曲线";
+    });
+
+    const paperEpisodes = computed(() => {
+      const items = paper.episodes?.items;
+      return Array.isArray(items) ? items : [];
+    });
+
+    function episodeMatchesActiveModule(episode) {
+      const type = String(episode?.simulation_type || "").toLowerCase();
+      const mode = String(episode?.mode || "").toLowerCase();
+      if (isPaperReplayModule.value) {
+        return type === "backtest" || ["backtest", "historical_replay"].includes(mode);
+      }
+      if (isPaperFutureModule.value) {
+        return type === "forecast" || ["forecast", "forward_test", "forecast_observation"].includes(mode);
+      }
+      if (isPaperAccountModule.value) {
+        return type === "paper_trade" || ["live", "paper_trade", "paper_account"].includes(mode);
+      }
+      return true;
+    }
+
+    const scopedPaperEpisodes = computed(() => paperEpisodes.value.filter(episodeMatchesActiveModule));
+
+    function summarizeEpisodeRows(rows) {
+      const observed = rows.filter((episode) => Number.isFinite(Number(episode.final_return)));
+      const returns = observed.map((episode) => Number(episode.final_return) || 0);
+      const wins = returns.filter((value) => value > 0).length;
+      const compounded = returns.reduce((value, item) => value * (1 + item), 1) - 1;
+      const confidenceValues = observed.map((episode) => Number(episode.confidence)).filter(Number.isFinite);
+      const targetSizes = rows.map((episode) => Number(episode.target_position_size)).filter(Number.isFinite);
+      return {
+        count: rows.length,
+        total_episodes: rows.length,
+        observed_count: observed.length,
+        total_return: returns.length ? compounded : 0,
+        average_return: returns.length ? returns.reduce((sum, item) => sum + item, 0) / returns.length : 0,
+        win_rate: returns.length ? wins / returns.length : 0,
+        average_confidence: confidenceValues.length ? confidenceValues.reduce((sum, item) => sum + item, 0) / confidenceValues.length : 0,
+        average_target_position_size: targetSizes.length ? targetSizes.reduce((sum, item) => sum + item, 0) / targetSizes.length : 0,
+      };
+    }
+
+    function facetRowsForEpisodes(rows, field) {
+      const grouped = {};
+      rows.forEach((episode) => {
+        const key = String(episode?.[field] || "unknown");
+        grouped[key] = grouped[key] || [];
+        grouped[key].push(episode);
+      });
+      return Object.entries(grouped).map(([name, items]) => ({
+        name,
+        ...summarizeEpisodeRows(items),
+      }));
+    }
+
+    const paperEpisodeSummary = computed(() => summarizeEpisodeRows(scopedPaperEpisodes.value));
+
+    const paperLedgerTitle = computed(() => {
+      if (isPaperReplayModule.value) return "历史回测账本";
+      if (isPaperFutureModule.value) return "推演模拟盘账本";
+      if (isPaperAccountModule.value) return "纸面账户账本";
+      return "模拟盘总账本";
+    });
+
+    const paperLedgerFacetRows = computed(() => {
+      const facetLabels = {
+        simulation_type: "类型",
+        mode: "模式",
+        rating: "评级",
+        action: "动作",
+        asset_type: "资产",
+      };
+      return ["simulation_type", "mode", "rating", "action", "asset_type"].flatMap((facetKey) => {
+        return facetRowsForEpisodes(scopedPaperEpisodes.value, facetKey)
+          .map((stats) => ({
+            facet: facetLabels[facetKey] || facetKey,
+            name: facetKey === "simulation_type" || facetKey === "mode"
+              ? simulationTypeLabel(stats.name)
+              : (facetKey === "action" ? localizeDecisionValue(stats.name) : stats.name),
+            count: Number(stats?.count) || 0,
+            observed_count: Number(stats?.observed_count) || 0,
+            average_return: Number(stats?.average_return) || 0,
+            win_rate: Number(stats?.win_rate) || 0,
+            average_confidence: Number(stats?.average_confidence) || 0,
+          }))
+          .filter((row) => row.count > 0)
+          .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+      });
+    });
+
+    const activeSimulationMeta = computed(() => {
+      const episode = paper.forecastResult?.episode || {};
+      return episode.tags?.simulation_config || episode.simulation || {};
+    });
+
+    const activeSimulationSourceCounts = computed(() => {
+      const meta = activeSimulationMeta.value || {};
+      const counts = meta.price_source_counts || {};
+      return {
+        real: Number(counts.real ?? meta.real_price_points ?? (paper.forecastResult?.episode?.tags || {}).real_price_points) || 0,
+        simulated: Number(counts.simulated ?? meta.simulated_price_points ?? (paper.forecastResult?.episode?.tags || {}).simulated_price_points) || 0,
+      };
+    });
+
+    const activeSimulationSummary = computed(() => {
+      return currentSimulationSummary();
+    });
+
+    const activeSimulationSourceLabel = computed(() => {
+      const counts = activeSimulationSourceCounts.value;
+      const horizonDays = Number(paper.forecastResult?.episode?.horizon_days || paper.horizonDays || 0) || (counts.real + counts.simulated);
+      const totalDays = Math.max(0, horizonDays);
+      const simulatedDays = Math.min(totalDays, counts.simulated);
+      const realDays = Math.max(0, totalDays - simulatedDays);
+      return `真实行情 ${realDays} 天 · 模拟行情 ${simulatedDays} 天 · 合计 ${totalDays} 天`;
+    });
+
+    const activeSimulationScenarioRows = computed(() => {
+      const scenarios = activeSimulationSummary.value?.scenarios || {};
+      return ["base", "bull", "bear", "stress"]
+        .map((name) => {
+          const summary = scenarios[name] || {};
+          const quantiles = summary.quantiles || {};
+          return {
+            name,
+            label: scenarioLabel(name),
+            paths: Number(summary.paths || 0),
+            p10: quantiles.p10,
+            p50: quantiles.p50,
+            p90: quantiles.p90,
+          };
+        })
+        .filter((row) => row.paths > 0);
+    });
+
 
     const selectedAlphaDetail = computed(() => {
       return (selectedTaskView.value.attachments || {}).alpha_mining_detail || {};
@@ -753,11 +1619,7 @@ createApp({
       if (!ts) {
         return "--:--:--";
       }
-      const date = new Date(ts);
-      if (Number.isNaN(date.getTime())) {
-        return String(ts).slice(11, 19) || String(ts);
-      }
-      return date.toLocaleTimeString("zh-CN", { hour12: false });
+      return formatLocalTime(ts);
     }
 
     const commandPreview = computed(() => {
@@ -805,7 +1667,10 @@ createApp({
       }
       modules.push({ id: "result", label: "运行结论", desc: "评级与仓位", group: "结果", groupStart: true });
       modules.push({ id: "report", label: "报告预览", desc: "正文与下载" });
-      modules.push({ id: "extras", label: "附加功能", desc: "回测与因子" });
+      modules.push({ id: "paper-replay", label: "历史回测", desc: "历史结论验证", group: "模拟盘", groupStart: true });
+      modules.push({ id: "paper-future", label: "推演模拟盘", desc: "模拟盘推演" });
+      modules.push({ id: "paper", label: "纸面账户", desc: "真实机会虚拟执行" });
+      modules.push({ id: "conclusions", label: "长期观察", desc: "统一复盘总账" });
       modules.push({ id: "history", label: "任务历史", desc: "回填与重跑", group: "管理", groupStart: true });
       if (!simpleMode.value) {
         modules.push({ id: "factors", label: "因子库", desc: "历史记录" });
@@ -842,6 +1707,28 @@ createApp({
 
     function setWorkbenchModule(module) {
       activeWorkbenchModule.value = module.id;
+      if (paperWorkbenchModuleIds.includes(module.id)) {
+        if (module.id === "paper-replay" && !["overview", "ledger", "api"].includes(selectedPaperTradingView.value)) {
+          selectedPaperTradingView.value = "overview";
+        }
+        if (module.id === "paper-future" && !["overview", "ledger", "api"].includes(selectedPaperTradingView.value)) {
+          selectedPaperTradingView.value = "overview";
+        }
+        refreshPaperTrading();
+        if (module.id === "paper-future" || module.id === "paper") {
+          startPaperPolling();
+        } else {
+          stopPaperPolling();
+        }
+      } else {
+        stopPaperPolling();
+      }
+      if (module.id === "conclusions") {
+        loadConclusions();
+        startObservationPolling();
+      } else {
+        stopObservationPolling();
+      }
       resetMainScroll();
     }
 
@@ -888,7 +1775,7 @@ createApp({
               status: "stale",
               phase: "服务已重启，任务状态需重新运行",
               result_summary: item.result_summary || "该任务只保存在浏览器历史中，后端当前进程已无法继续轮询或取消。",
-              updated_at: new Date().toISOString(),
+              updated_at: localTimestamp(),
             };
           }
           return item;
@@ -906,6 +1793,15 @@ createApp({
       localStorage.setItem(`tradingagents_workbench_history_${userId}`, JSON.stringify(taskHistory.value.slice(0, 20)));
     }
 
+    function isTerminalRunStatus(status) {
+      return ["completed", "failed", "cancelled"].includes(status);
+    }
+
+    function historySortTime(item) {
+      const timestamp = Date.parse(item?.updated_at || item?.persisted_at || item?.created_at || "");
+      return Number.isFinite(timestamp) ? timestamp : 0;
+    }
+
     function applyHistoryItems(items = []) {
       const normalized = items
         .filter((item) => item?.run_id)
@@ -921,7 +1817,7 @@ createApp({
           rating: item.result?.rating || item.rating || "",
           result_summary: item.result?.summary || item.result_summary || "",
           report_path: item.attachments?.report_path || item.report_path || "",
-          updated_at: item.updated_at || item.persisted_at || new Date().toISOString(),
+          updated_at: item.updated_at || item.persisted_at || localTimestamp(),
           payload: item.payload || null,
           checkpoint_enabled: !!item.checkpoint_enabled,
           checkpoint_available: !!item.checkpoint_available,
@@ -945,11 +1841,23 @@ createApp({
           byId.set(item.run_id, item);
         }
       });
-      taskHistory.value = Array.from(byId.values()).slice(0, 50);
+      taskHistory.value = Array.from(byId.values())
+        .sort((a, b) => historySortTime(b) - historySortTime(a))
+        .slice(0, 50);
       if (!selectedTaskRunId.value && taskHistory.value.length > 0) {
         selectedTaskRunId.value = taskHistory.value[0].run_id;
       }
       persistTaskHistory();
+    }
+
+    async function refreshRunSnapshot(runId) {
+      if (!backend.connected || !runId) {
+        return null;
+      }
+      const snapshot = await fetchJson(`/api/runs/${runId}`);
+      syncBackendQueue(snapshot.queue || {});
+      applyRunSnapshot(snapshot);
+      return snapshot;
     }
 
     async function loadServerHistory() {
@@ -962,9 +1870,7 @@ createApp({
         applyHistoryItems(payload.items || []);
         if (selectedTaskRunId.value) {
           try {
-            const snapshot = await fetchJson(`/api/runs/${selectedTaskRunId.value}`);
-            syncBackendQueue(snapshot.queue || {});
-            applyRunSnapshot(snapshot);
+            await refreshRunSnapshot(selectedTaskRunId.value);
           } catch (error) {
             logs.value.unshift(`[warning] 刷新当前任务详情失败: ${error.message}`);
           }
@@ -1060,7 +1966,7 @@ createApp({
         rating: snapshot.result?.rating || "",
         result_summary: snapshot.result?.summary || "",
         report_path: snapshot.attachments?.report_path || "",
-        updated_at: snapshot.updated_at || new Date().toISOString(),
+        updated_at: snapshot.updated_at || localTimestamp(),
         payload: snapshot.payload || null,
         checkpoint_enabled: !!snapshot.checkpoint_enabled,
         checkpoint_available: !!snapshot.checkpoint_available,
@@ -1294,6 +2200,711 @@ createApp({
       }
     }
 
+    function syncConclusionsPayload(payload) {
+      conclusions.items = Array.isArray(payload.items) ? payload.items : [];
+      conclusions.summary = payload.summary || {};
+      if (!conclusions.items.some((item) => item.conclusion_id === conclusions.selectedConclusionId)) {
+        conclusions.selectedConclusionId = conclusions.items[0]?.conclusion_id || "";
+      }
+    }
+
+    async function refreshObservationIntraday({ quiet = false } = {}) {
+      const ticker = observationTicker.value;
+      if (!ticker) {
+        return;
+      }
+      const matchedTrack = conclusions.items.find((item) => String(item?.ticker || "").toUpperCase() === ticker) || {};
+      const assetType = looksLikeCryptoTicker(ticker)
+        ? "crypto"
+        : (matchedTrack.asset_type || conclusions.form.assetType || form.assetType);
+      conclusions.quoteLoading = true;
+      try {
+        const query = `ticker=${encodeURIComponent(ticker)}&asset_type=${encodeURIComponent(assetType || "stock")}`;
+        const quote = await fetchJson(`/api/simulation/observation/intraday?${query}`);
+        const today = localDateInputValue();
+        const intradayRows = Array.isArray(quote.intraday)
+          ? quote.intraday
+          : (Array.isArray(quote.history)
+            ? quote.history
+              .map((row) => ({
+                time: row.time || row.timestamp || row.datetime || row.date || quote.as_of,
+                price: row.price ?? row.close ?? row.Close,
+                open: row.open ?? row.Open,
+                high: row.high ?? row.High,
+                low: row.low ?? row.Low,
+                volume: row.volume ?? row.Volume,
+              }))
+              .filter((row) => Number.isFinite(Number(row.price)))
+            : []);
+        const todayRows = intradayRows.filter((row) => String(row.time || row.as_of || "").slice(0, 10) === today);
+        conclusions.intradayRows = todayRows.length
+          ? todayRows
+          : (intradayRows.length && String(intradayRows[intradayRows.length - 1]?.time || "").slice(0, 10) === today
+            ? [intradayRows[intradayRows.length - 1]]
+            : []);
+        if (!conclusions.intradayRows.length) {
+          conclusions.intradayRows = [{
+            time: quote.as_of || localTimestamp(),
+            price: quote.price,
+            open: quote.price,
+            high: quote.price,
+            low: quote.price,
+            volume: null,
+          }];
+        }
+        conclusions.quote = quote;
+        conclusions.quoteLastUpdated = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+      } catch (error) {
+        if (!quiet) {
+          logs.value.unshift(`[conclusion] 当日实时价格刷新失败: ${extractErrorMessage(error.message)}`);
+        }
+      } finally {
+        conclusions.quoteLoading = false;
+      }
+    }
+
+    function conclusionStatusLabel(status) {
+      const labels = {
+        proposed: "待观察",
+        tracking: "跟踪中",
+        due_review: "待复盘",
+        validated: "已验证",
+        invalidated: "已失效",
+        exited: "已退出",
+        archived: "已归档",
+      };
+      return labels[status] || status || "tracking";
+    }
+
+    function scenarioLabel(value) {
+      const labels = {
+        base: "基准",
+        neutral: "中性",
+        bull: "乐观",
+        bear: "悲观",
+        stress: "压力",
+      };
+      return labels[String(value || "").toLowerCase()] || value || "基准";
+    }
+
+    function simulationTypeLabel(value) {
+      const labels = {
+        forecast: "推演",
+        paper_trade: "纸面",
+        backtest: "回测",
+        historical_replay: "回测",
+        forward_test: "推演",
+        live: "纸面",
+      };
+      return labels[String(value || "").toLowerCase()] || value || "未知";
+    }
+
+    function simulationStateLabel(value) {
+      const labels = {
+        simulated_path: "全模拟",
+        mixed_real_simulated: "真实+模拟",
+        real_history: "全真实",
+        tracking_without_future_data: "待回补",
+        pending: "待回补",
+        valid: "仍有效",
+        drifting: "有偏差",
+        invalidated: "已失效",
+        unresolved: "未解析",
+        no_trade: "无交易",
+        completed: "已完成",
+        tracking: "跟踪中",
+        due_review: "待复盘",
+      };
+      return labels[String(value || "").toLowerCase()] || conclusionStatusLabel(value);
+    }
+
+    async function refreshConclusionsLifecycle({ quiet = false } = {}) {
+      if (!quiet) {
+        conclusions.loading = true;
+        conclusions.error = "";
+      }
+      try {
+        syncConclusionsPayload(await fetchJson("/api/observations"));
+        conclusions.lifecycleLastUpdated = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+      } catch (error) {
+        if (!quiet) {
+          conclusions.error = error.message;
+          logs.value.unshift(`[conclusion] 加载研究跟踪盘失败: ${error.message}`);
+        }
+      } finally {
+        if (!quiet) {
+          conclusions.loading = false;
+        }
+      }
+    }
+
+    async function loadConclusions() {
+      await refreshConclusionsLifecycle();
+      await refreshObservationIntraday({ quiet: true });
+    }
+
+    async function addManualConclusion() {
+      const ticker = String(conclusions.form.ticker || form.ticker || "").trim().toUpperCase();
+      if (!ticker) {
+        conclusions.error = "请先输入股票或币种代码";
+        return;
+      }
+      const payload = {
+        ticker,
+        asset_type: conclusions.form.assetType || form.assetType,
+        thesis: conclusions.form.thesis,
+        rating: conclusions.form.rating,
+        action: conclusions.form.action,
+        target_position_size: conclusions.form.targetPositionSize,
+        horizon_days: conclusions.form.horizonDays,
+      };
+      try {
+        const result = await fetchJson("/api/observations", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        syncConclusionsPayload(result);
+        conclusions.lifecycleLastUpdated = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+        conclusions.form.thesis = "";
+        logs.value.unshift(`[conclusion] ${ticker} 已加入研究跟踪盘`);
+      } catch (error) {
+        conclusions.error = error.message;
+      }
+    }
+
+    async function addSelectedRunConclusion() {
+      const runId = selectedTaskView.value.run_id;
+      if (!runId) {
+        conclusions.error = "当前没有可入池的任务";
+        return;
+      }
+      try {
+        const result = await fetchJson("/api/observations/from-run", {
+          method: "POST",
+          body: JSON.stringify({ run_id: runId }),
+        });
+        syncConclusionsPayload(result);
+        conclusions.lifecycleLastUpdated = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+        logs.value.unshift(`[conclusion] 当前任务结论已入池: ${runId}`);
+      } catch (error) {
+        conclusions.error = error.message;
+      }
+    }
+
+    async function reviewConclusion(track, status) {
+      if (!track?.conclusion_id) {
+        return;
+      }
+      const note = conclusions.reviewNotes[track.conclusion_id] || "";
+      try {
+        const result = await fetchJson("/api/observations/update", {
+          method: "POST",
+          body: JSON.stringify({
+            conclusion_id: track.conclusion_id,
+            status,
+            review_notes: note,
+            note,
+            event_type: "review",
+          }),
+        });
+        syncConclusionsPayload(result);
+        conclusions.lifecycleLastUpdated = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+        logs.value.unshift(`[conclusion] ${track.ticker} 已标记为 ${conclusionStatusLabel(status)}`);
+      } catch (error) {
+        conclusions.error = error.message;
+      }
+    }
+
+    async function deleteConclusion(track) {
+      if (!track?.conclusion_id) {
+        return;
+      }
+      const confirmed = window.confirm(
+        `确认删除 ${track.ticker || "这条结论"} 的研究跟踪记录？\n\n删除后不会再出现在跟踪盘，且不可恢复。`
+      );
+      if (!confirmed) {
+        return;
+      }
+      try {
+        const result = await fetchJson("/api/observations/delete", {
+          method: "POST",
+          body: JSON.stringify({ conclusion_id: track.conclusion_id }),
+        });
+        delete conclusions.reviewNotes[track.conclusion_id];
+        syncConclusionsPayload(result);
+        conclusions.lifecycleLastUpdated = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+        logs.value.unshift(`[conclusion] 已删除 ${track.ticker || track.conclusion_id} 的跟踪记录`);
+      } catch (error) {
+        conclusions.error = error.message;
+      }
+    }
+
+    let paperPollTimer = null;
+    let observationPollTimer = null;
+    let observationLifecyclePollTimer = null;
+
+    function rememberPaperQuote(quote, ticker = paper.ticker) {
+      const price = Number(quote?.price);
+      const normalizedTicker = String(ticker || "").trim().toUpperCase();
+      if (!normalizedTicker || !Number.isFinite(price)) {
+        return;
+      }
+      const asOf = normalizeLiveQuoteTime(quote?.as_of);
+      const last = paper.quoteHistory[paper.quoteHistory.length - 1];
+      if (last && last.ticker === normalizedTicker && last.as_of === asOf && last.price === price) {
+        return;
+      }
+      paper.quoteHistory.push({
+        ticker: normalizedTicker,
+        price,
+        as_of: asOf,
+      });
+      if (paper.quoteHistory.length > 240) {
+        paper.quoteHistory.splice(0, paper.quoteHistory.length - 240);
+      }
+    }
+
+    function updatePaperChartHover(event) {
+      const rect = event.currentTarget.getBoundingClientRect();
+      if (!rect.width || !activePaperChart.value.series.length) {
+        paper.chartHover = null;
+        return;
+      }
+      const svgX = (event.clientX - rect.left) / rect.width * 700;
+      const axisSeries = activePaperChart.value.series.find((item) => item.key === "price") || activePaperChart.value.series[0];
+      const anchor = (axisSeries.pointItems || []).reduce((best, item) => {
+        if (!best || Math.abs(item.x - svgX) < Math.abs(best.x - svgX)) {
+          return item;
+        }
+        return best;
+      }, null);
+      if (!anchor) {
+        paper.chartHover = null;
+        return;
+      }
+      const items = activePaperChart.value.series.map((series) => {
+        const point = (series.pointItems || []).reduce((best, item) => {
+          if (!best || Math.abs(item.x - anchor.x) < Math.abs(best.x - anchor.x)) {
+            return item;
+          }
+          return best;
+        }, null);
+        return point ? {
+          key: series.key,
+          label: series.label,
+          value: point.value,
+          decimals: series.decimals,
+          x: point.x,
+          y: point.y,
+        } : null;
+      }).filter(Boolean);
+      paper.chartHover = {
+        x: anchor.x,
+        y: anchor.y,
+        date: formatChartHoverLabel(anchor.date),
+        items,
+      };
+    }
+
+    function clearPaperChartHover() {
+      paper.chartHover = null;
+    }
+
+    function updateObservationChartHover(event) {
+      const rect = event.currentTarget.getBoundingClientRect();
+      if (!rect.width || !observationReturnChart.value.series.length) {
+        conclusions.chartHover = null;
+        return;
+      }
+      const svgX = (event.clientX - rect.left) / rect.width * 700;
+      const axisSeries = observationReturnChart.value.series[0];
+      const anchor = (axisSeries.pointItems || []).reduce((best, item) => {
+        if (!best || Math.abs(item.x - svgX) < Math.abs(best.x - svgX)) {
+          return item;
+        }
+        return best;
+      }, null);
+      if (!anchor) {
+        conclusions.chartHover = null;
+        return;
+      }
+      conclusions.chartHover = {
+        x: anchor.x,
+        y: anchor.y,
+        date: formatChartHoverLabel(anchor.date),
+        items: observationReturnChart.value.series.map((series) => {
+          const point = (series.pointItems || []).reduce((best, item) => {
+            if (!best || Math.abs(item.x - anchor.x) < Math.abs(best.x - anchor.x)) {
+              return item;
+            }
+            return best;
+          }, null);
+          return point ? {
+            key: series.key,
+            label: series.label,
+            value: point.value,
+            decimals: series.decimals,
+            x: point.x,
+            y: point.y,
+          } : null;
+        }).filter(Boolean),
+      };
+    }
+
+    function clearObservationChartHover() {
+      conclusions.chartHover = null;
+    }
+
+    async function loadPaperAnalyticsSkills() {
+      const payload = await fetchJson("/api/simulation/forecast/skills");
+      paper.analyticsSkills = Array.isArray(payload.items) ? payload.items : [];
+      paper.analyticsSkills.forEach((skill) => {
+        if (paper.selectedAnalyticsSkills[skill.name] === undefined) {
+          paper.selectedAnalyticsSkills[skill.name] = !!skill.default_enabled;
+        }
+      });
+    }
+
+    function selectedPaperSkillNames() {
+      const selected = paper.analyticsSkills
+        .filter((skill) => skill.available !== false && paper.selectedAnalyticsSkills[skill.name])
+        .map((skill) => skill.name);
+      return selected.length ? selected : ["builtin_performance", "conclusion_lifecycle"];
+    }
+
+    async function refreshPaperAnalytics() {
+      if (!paper.analyticsSkills.length) {
+        await loadPaperAnalyticsSkills();
+      }
+      const skills = selectedPaperSkillNames().map(encodeURIComponent).join(",");
+      paper.analytics = await fetchJson(`/api/simulation/forecast/analytics?skills=${skills}`);
+    }
+
+    async function refreshPaperEpisodes() {
+      try {
+        paper.episodes = await fetchJson("/api/simulation/episodes?limit=200");
+        paper.ledgerLastUpdated = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+      } catch (error) {
+        logs.value.unshift(`[paper] 演练账本暂不可用: ${extractErrorMessage(error.message)}`);
+      }
+    }
+
+    async function refreshPaperTrading({ quiet = false } = {}) {
+      const ticker = String(paper.ticker || "").trim().toUpperCase();
+      if (!ticker) {
+        paper.error = "请先输入股票或币种代码";
+        return;
+      }
+      paper.ticker = ticker;
+      if (!paper.replayTicker) {
+        paper.replayTicker = ticker;
+      }
+      if (!paper.replayTradeDate) {
+        const defaultReplayDate = new Date();
+        defaultReplayDate.setDate(defaultReplayDate.getDate() - 30);
+        paper.replayTradeDate = localDateInputValue(defaultReplayDate);
+      }
+      if (looksLikeCryptoTicker(ticker)) {
+        paper.assetType = "crypto";
+      }
+      paper.loading = true;
+      if (!quiet) {
+        paper.error = "";
+      }
+      try {
+        const query = `ticker=${encodeURIComponent(ticker)}&asset_type=${encodeURIComponent(paper.assetType)}`;
+        const [quote, account, signals] = await Promise.all([
+          fetchJson(`/api/simulation/forecast/quote?${query}`),
+          fetchJson(`/api/simulation/forecast/account?${query}`),
+          fetchJson("/api/simulation/forecast/signals"),
+        ]);
+        await Promise.all([refreshPaperAnalytics(), refreshPaperEpisodes()]);
+        paper.quote = quote;
+        rememberPaperQuote(quote, ticker);
+        paper.account = account;
+        paper.signals = Array.isArray(signals.items) ? signals.items : [];
+        paper.lastUpdated = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+      } catch (error) {
+        paper.error = error.message;
+        if (!quiet) {
+          logs.value.unshift(`[paper] 刷新模拟盘失败: ${error.message}`);
+        }
+      } finally {
+        paper.loading = false;
+      }
+    }
+
+    function startPaperPolling() {
+      window.clearInterval(paperPollTimer);
+      if (!paper.autoRefresh) {
+        return;
+      }
+      paperPollTimer = window.setInterval(() => {
+        if (activeWorkbenchModule.value === "paper" || activeWorkbenchModule.value === "paper-future") {
+          refreshPaperTrading({ quiet: true });
+        }
+      }, 15000);
+    }
+
+    function stopPaperPolling() {
+      window.clearInterval(paperPollTimer);
+      paperPollTimer = null;
+    }
+
+    function startObservationPolling() {
+      window.clearInterval(observationPollTimer);
+      window.clearInterval(observationLifecyclePollTimer);
+      observationPollTimer = window.setInterval(() => {
+        if (activeWorkbenchModule.value === "conclusions") {
+          refreshObservationIntraday({ quiet: true });
+        }
+      }, 15000);
+      observationLifecyclePollTimer = window.setInterval(() => {
+        if (activeWorkbenchModule.value === "conclusions") {
+          refreshConclusionsLifecycle({ quiet: true });
+        }
+      }, 300000);
+    }
+
+    function stopObservationPolling() {
+      window.clearInterval(observationPollTimer);
+      window.clearInterval(observationLifecyclePollTimer);
+      observationPollTimer = null;
+      observationLifecyclePollTimer = null;
+    }
+
+    async function resetPaperAccount() {
+      try {
+        const payload = await fetchJson("/api/simulation/forecast/reset", {
+          method: "POST",
+          body: JSON.stringify({ initial_cash: paper.initialCash }),
+        });
+        paper.account = payload.account;
+        logs.value.unshift("[paper] 模拟账户已重置");
+        await refreshPaperTrading({ quiet: true });
+      } catch (error) {
+        paper.error = error.message;
+      }
+    }
+
+    async function submitForecastObservation(orderOverride = null) {
+      const source = orderOverride || {};
+      const payload = {
+        ticker: source.ticker || paper.ticker,
+        asset_type: source.asset_type || paper.assetType,
+        action: source.action || paper.action,
+        rating: source.rating || "Forecast",
+        target_position_size: source.target_position_size ?? paper.targetPositionSize,
+        risk_gate_approved: source.risk_gate_approved ?? true,
+        source_run_id: source.source_run_id || "",
+        thesis: source.thesis ?? paper.conclusionThesis,
+        horizon_days: source.horizon_days ?? paper.horizonDays,
+        confidence: source.confidence ?? 0,
+        analysis_date: source.analysis_date || paper.forecastAnalysisDate || localDateInputValue(),
+        entry_price: source.entry_price || paper.forecastEntryPrice || undefined,
+        simulation_scenario: paper.simulationScenario,
+        simulation_drift: paper.simulationDrift || undefined,
+        simulation_volatility: paper.simulationVolatility || undefined,
+        simulation_seed: paper.simulationSeed || undefined,
+        simulation_paths: paper.simulationPaths || undefined,
+        execute_paper_account: !!paper.executePaperAccount,
+        commission_rate: paper.commissionRate,
+        slippage_rate: paper.slippageRate,
+      };
+      try {
+        const result = await fetchJson("/api/forecast-observations", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        paper.forecastResult = result;
+        paper.quote = result.quote || paper.quote;
+        if (result.paper?.account) {
+          paper.account = result.paper.account;
+        }
+        syncConclusionsPayload(result);
+        await Promise.all([refreshPaperEpisodes(), refreshPaperAnalytics()]);
+        logs.value.unshift(
+          paper.executePaperAccount
+            ? "[simulation] 推演记录已入池，并同步写入纸面账户"
+            : "[simulation] 推演模拟盘已入池"
+        );
+      } catch (error) {
+        paper.error = error.message;
+        logs.value.unshift(`[simulation] 运行推演模拟盘失败: ${error.message}`);
+      }
+    }
+
+    async function submitPaperOrder(orderOverride = null) {
+      const source = orderOverride || {};
+      const payload = {
+        ticker: paper.ticker,
+        asset_type: paper.assetType,
+        action: source.action || paper.action,
+        rating: source.rating || "Manual",
+        target_position_size: source.target_position_size ?? paper.targetPositionSize,
+        risk_gate_approved: source.risk_gate_approved ?? true,
+        source_run_id: source.source_run_id || "",
+        thesis: source.thesis ?? paper.conclusionThesis,
+        horizon_days: source.horizon_days ?? paper.horizonDays,
+        commission_rate: paper.commissionRate,
+        slippage_rate: paper.slippageRate,
+      };
+      try {
+        const result = await fetchJson("/api/simulation/forecast/order", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        paper.quote = result.quote;
+        rememberPaperQuote(result.quote, payload.ticker);
+        paper.account = result.account;
+        await Promise.all([refreshPaperAnalytics(), refreshPaperEpisodes()]);
+        logs.value.unshift(result.fill ? "[paper] 模拟成交已写入账户" : "[paper] 订单未产生新成交");
+      } catch (error) {
+        paper.error = error.message;
+        logs.value.unshift(`[paper] 下单失败: ${error.message}`);
+      }
+    }
+
+    function applyPaperSignal(options = {}) {
+      const submit = typeof options === "boolean" ? options : options.submit !== false;
+      const mode = options.mode || "live";
+      const runId = options.runId || (mode === "replay" ? paper.selectedReplaySignalRunId : paper.selectedSignalRunId);
+      const signal = paper.signals.find((item) => item.run_id === runId);
+      if (!signal || !signal.execution_plan) {
+        paper.error = "请选择一个带 execution_plan 的历史任务";
+        return;
+      }
+      const plan = signal.execution_plan || {};
+      const liveMode = mode !== "replay";
+      const targetPosition = plan.target_position_size ?? plan.position_size ?? (liveMode ? paper.targetPositionSize : paper.replayTargetPositionSize);
+      const horizonDays = plan.horizon_days ?? plan.time_horizon_days ?? plan.holding_days ?? (liveMode ? paper.horizonDays : paper.replayHorizonDays);
+      const action = plan.action || (liveMode ? paper.action : paper.replayAction);
+      const thesis = signal.summary || plan.thesis || (liveMode ? paper.conclusionThesis : paper.replayThesis);
+      if (liveMode) {
+        paper.ticker = String(signal.ticker || paper.ticker || "").toUpperCase();
+        paper.assetType = signal.asset_type || paper.assetType;
+        paper.action = action;
+        paper.targetPositionSize = String(targetPosition);
+        paper.horizonDays = String(horizonDays);
+        paper.forecastAnalysisDate = String(signal.analysis_date || paper.forecastAnalysisDate || localDateInputValue()).slice(0, 10);
+        paper.conclusionThesis = thesis;
+      } else {
+        paper.replayTicker = String(signal.ticker || paper.replayTicker || paper.ticker || "").toUpperCase();
+        paper.replayTradeDate = String(signal.analysis_date || paper.replayTradeDate || "").slice(0, 10);
+        paper.replayAction = action;
+        paper.replayTargetPositionSize = String(targetPosition);
+        paper.replayHorizonDays = String(horizonDays);
+        paper.replayThesis = thesis;
+      }
+      paper.error = "";
+      if (!submit) {
+        logs.value.unshift(`[paper] 已回填${liveMode ? "未来推演" : "历史回测"}参数: ${signal.ticker || paper.ticker}`);
+        return;
+      }
+      if (!liveMode) {
+        replayHistoricalPaperSignal(signal);
+        return;
+      }
+      const submitFn = isPaperAccountModule.value ? submitPaperOrder : submitForecastObservation;
+      submitFn({
+        action,
+        rating: signal.rating || action,
+        target_position_size: targetPosition,
+        risk_gate_approved: plan.risk_gate_approved,
+        source_run_id: signal.run_id,
+        thesis: paper.conclusionThesis || "",
+        horizon_days: horizonDays,
+      });
+    }
+
+    function isHistoricalPaperSignal(signal) {
+      const signalDate = String(signal?.analysis_date || "").slice(0, 10);
+      return Boolean(signalDate) && signalDate < localDateInputValue();
+    }
+
+    function selectedPaperSignal(runId = paper.selectedSignalRunId) {
+      return paper.signals.find((item) => item.run_id === runId) || null;
+    }
+
+    function paperSignalSubmitLabel(mode = "live") {
+      if (mode === "replay") {
+        return "运行历史真实数据回测";
+      }
+      return isPaperAccountModule.value ? "用当前行情纸面下单" : "运行推演模拟盘";
+    }
+
+    async function replayHistoricalPaperSignal(signal) {
+      paper.loading = true;
+      paper.error = "";
+      try {
+        const payload = await fetchJson("/api/simulation/backtest/from-signal", {
+          method: "POST",
+          body: JSON.stringify({
+            run_id: signal.run_id,
+            ticker: signal.ticker || paper.ticker,
+            asset_type: signal.asset_type || paper.assetType,
+            trade_date: signal.analysis_date,
+            action: paper.replayAction,
+            target_position_size: paper.replayTargetPositionSize,
+            horizon_days: paper.replayHorizonDays,
+            initial_cash: paper.initialCash,
+            commission_rate: paper.commissionRate,
+            slippage_rate: paper.slippageRate,
+          }),
+        });
+        paper.replayAccount = payload.account;
+        paper.replayAnalytics = payload.analytics || null;
+        paper.replayResult = payload.result || null;
+        await refreshPaperEpisodes();
+        paper.replayLastUpdated = formatLocalTime(localTimestamp());
+        logs.value.unshift(`[paper] 已按 ${signal.analysis_date} 历史真实数据完成回放模拟`);
+      } catch (error) {
+        paper.error = error.message;
+        logs.value.unshift(`[paper] 历史回测失败: ${error.message}`);
+      } finally {
+        paper.loading = false;
+      }
+    }
+
+    async function replayManualHistoricalPaper() {
+      const ticker = String(paper.replayTicker || paper.ticker || "").trim().toUpperCase();
+      const tradeDate = String(paper.replayTradeDate || "").trim().slice(0, 10);
+      if (!ticker || !tradeDate) {
+        paper.error = "请填写历史回测标的和日期";
+        return;
+      }
+      paper.loading = true;
+      paper.error = "";
+      try {
+        const payload = await fetchJson("/api/simulation/backtest/manual", {
+          method: "POST",
+          body: JSON.stringify({
+            ticker,
+            asset_type: looksLikeCryptoTicker(ticker) ? "crypto" : paper.assetType,
+            trade_date: tradeDate,
+            action: paper.replayAction,
+            target_position_size: paper.replayTargetPositionSize,
+            horizon_days: paper.replayHorizonDays,
+            initial_cash: paper.initialCash,
+            commission_rate: paper.commissionRate,
+            slippage_rate: paper.slippageRate,
+            thesis: paper.replayThesis,
+          }),
+        });
+        paper.replayAccount = payload.account;
+        paper.replayAnalytics = payload.analytics || null;
+        paper.replayResult = payload.result || null;
+        await refreshPaperEpisodes();
+        paper.replayLastUpdated = formatLocalTime(localTimestamp());
+        logs.value.unshift(`[paper] 已按 ${tradeDate} 手动历史数据完成回放模拟`);
+      } catch (error) {
+        paper.error = error.message;
+        logs.value.unshift(`[paper] 手动历史回测失败: ${error.message}`);
+      } finally {
+        paper.loading = false;
+      }
+    }
+
     async function cancelSelectedTask(targetRunId = "") {
       const runId = targetRunId || selectedTaskView.value.run_id;
       if (!runId) {
@@ -1307,7 +2918,7 @@ createApp({
           status: "cancelling",
           phase: "取消中...",
           cancel_requested: true,
-          updated_at: new Date().toISOString(),
+          updated_at: localTimestamp(),
         };
         taskHistory.value.splice(existingIndex, 1, nextItem);
         persistTaskHistory();
@@ -1336,7 +2947,7 @@ createApp({
               status: "cancelled",
               phase: "已取消",
               cancel_requested: true,
-              updated_at: new Date().toISOString(),
+              updated_at: localTimestamp(),
               result_summary: "服务已重启或任务不在当前进程内，已在本地历史中标记为取消。",
               result: {
                 ...(taskHistory.value[index].result || {}),
@@ -1371,7 +2982,7 @@ createApp({
             status: "cancelled",
             phase: "Workbench 重启中",
             cancel_requested: true,
-            updated_at: new Date().toISOString(),
+            updated_at: localTimestamp(),
             result_summary: "Workbench 已强制重启，当前阻塞任务已硬取消。",
             result: {
               ...(taskHistory.value[existingIndex].result || {}),
@@ -1803,15 +3414,58 @@ createApp({
     }
 
     function extractErrorMessage(message) {
+      const raw = String(message || "");
+      if (/<!doctype html|<html/i.test(raw)) {
+        const codeMatch = raw.match(/Error code:\s*([0-9]+)/i) || raw.match(/<p>\s*Error code:\s*([0-9]+)\s*<\/p>/i);
+        const messageMatch = raw.match(/Message:\s*([^<]+)/i) || raw.match(/<p>\s*Message:\s*([^<]+)\s*<\/p>/i);
+        if (codeMatch || messageMatch) {
+          const code = codeMatch ? codeMatch[1] : "";
+          const text = messageMatch ? messageMatch[1].trim() : "接口返回了 HTML 错误页";
+          return code ? `HTTP ${code}: ${text}` : text;
+        }
+        const cleanText = raw
+          .replace(/<[^>]+>/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+        return cleanText || "请求返回了 HTML 错误页。";
+      }
       try {
-        const parsed = JSON.parse(message);
+        const parsed = JSON.parse(raw);
         return parsed.message || parsed.error || message;
       } catch (error) {
-        return message || "请求失败。";
+        return raw || "请求失败。";
       }
     }
 
-    async function fetchJson(url, options = {}) {
+    function legacyApiFallbackUrl(url) {
+      const raw = String(url || "");
+      const [path, query = ""] = raw.split("?");
+      const aliases = {
+        "/api/observations": "/api/conclusions",
+        "/api/observations/from-run": "/api/conclusions/from-run",
+        "/api/observations/update": "/api/conclusions/update",
+        "/api/observations/delete": "/api/conclusions/delete",
+        "/api/simulation/forecast/account": "/api/paper/account",
+        "/api/simulation/forecast/quote": "/api/paper/quote",
+        "/api/simulation/forecast/signals": "/api/paper/signals",
+        "/api/simulation/forecast/skills": "/api/paper/skills",
+        "/api/simulation/forecast/analytics": "/api/paper/analytics",
+        "/api/simulation/forecast/reset": "/api/paper/reset",
+        "/api/simulation/forecast/order": "/api/paper/order",
+        "/api/simulation/forecast/observe": "/api/forecast-observations",
+        "/api/simulation/backtest/from-signal": "/api/paper/replay-signal",
+        "/api/simulation/backtest/manual": "/api/paper/replay-manual",
+        "/api/simulation/observation/intraday": "/api/paper/intraday",
+        "/api/simulation/episodes": "/api/paper/episodes",
+      };
+      const fallbackPath = aliases[path];
+      if (!fallbackPath) {
+        return "";
+      }
+      return query ? `${fallbackPath}?${query}` : fallbackPath;
+    }
+
+    async function requestJson(url, options = {}) {
       const response = await fetch(url, {
         credentials: "same-origin",
         headers: {
@@ -1827,10 +3481,25 @@ createApp({
         if (response.status === 401 && !url.startsWith("/api/auth/")) {
           authState.authenticated = false;
         }
-        throw new Error(message || `HTTP ${response.status}`);
+        const error = new Error(extractErrorMessage(message || `HTTP ${response.status}`));
+        error.status = response.status;
+        throw error;
       }
 
       return response.json();
+    }
+
+    async function fetchJson(url, options = {}) {
+      try {
+        return await requestJson(url, options);
+      } catch (error) {
+        const fallbackUrl = error.status === 404 ? legacyApiFallbackUrl(url) : "";
+        if (!fallbackUrl) {
+          throw error;
+        }
+        logs.value.unshift(`[compat] ${url} 返回 404，已切换旧接口 ${fallbackUrl}`);
+        return requestJson(fallbackUrl, options);
+      }
     }
 
     function applyRunSnapshot(snapshot) {
@@ -1888,6 +3557,12 @@ createApp({
         attachments.backtestDetail = Array.isArray(snapshot.attachments.backtest_detail)
           ? snapshot.attachments.backtest_detail
           : [];
+        attachments.paperTradingEnabled = !!snapshot.attachments.paper_trading_enabled;
+        attachments.paperTradingSummary = snapshot.attachments.paper_trading_summary || "";
+        attachments.paperTradingDetail = Array.isArray(snapshot.attachments.paper_trading_detail)
+          ? snapshot.attachments.paper_trading_detail
+          : [];
+        attachments.paperTradingConfig = snapshot.attachments.paper_trading_config || {};
         attachments.alphaMiningEnabled = !!snapshot.attachments.alpha_mining_enabled;
         attachments.alphaMiningSummary = snapshot.attachments.alpha_mining_summary || "";
         attachments.alphaMiningDetail = snapshot.attachments.alpha_mining_detail || null;
@@ -1930,8 +3605,11 @@ createApp({
         if (!raw) {
           return false;
         }
-        applyFormSnapshot(JSON.parse(raw));
-        logs.value.unshift("[system] 已载入你的默认任务参数");
+        const defaults = JSON.parse(raw);
+        delete defaults.analysisDate;
+        applyFormSnapshot(defaults);
+        form.analysisDate = localDateInputValue();
+        logs.value.unshift("[system] 已载入你的默认任务参数，分析日期使用今天");
         return true;
       } catch (error) {
         logs.value.unshift("[warning] 默认任务参数读取失败，已使用系统默认值");
@@ -1940,11 +3618,13 @@ createApp({
     }
 
     function saveDefaultParams() {
+      const defaults = snapshotForm();
+      delete defaults.analysisDate;
       localStorage.setItem(
         `tradingagents_workbench_default_params_v2_${userId}`,
-        JSON.stringify(snapshotForm())
+        JSON.stringify(defaults)
       );
-      logs.value.unshift("[system] 已将当前任务参数设为默认");
+      logs.value.unshift("[system] 已将当前任务参数设为默认，分析日期每天自动使用当天");
     }
 
     function clearDefaultParams() {
@@ -1973,7 +3653,7 @@ createApp({
       }
       const entry = {
         name,
-        savedAt: new Date().toISOString(),
+        savedAt: localTimestamp(),
         config: snapshotForm(),
       };
       const existingIndex = presetState.items.findIndex((item) => item.name === name);
@@ -2133,25 +3813,43 @@ createApp({
 
     let pollTimer = null;
 
+    function scheduleTerminalRunReconcile(runId) {
+      window.clearTimeout(window.__taTerminalSnapshotTimer);
+      window.clearTimeout(window.__taTerminalHistoryTimer);
+      window.__taTerminalSnapshotTimer = window.setTimeout(async () => {
+        try {
+          await refreshRunSnapshot(runId);
+        } catch (error) {
+          logs.value.unshift(`[warning] 终态快照确认失败: ${error.message}`);
+        }
+      }, 500);
+      window.__taTerminalHistoryTimer = window.setTimeout(async () => {
+        try {
+          await loadServerHistory();
+        } catch (error) {
+          logs.value.unshift(`[warning] 终态历史同步失败: ${error.message}`);
+        }
+      }, 1800);
+    }
+
     async function pollRun(runId) {
       if (!backend.connected || !runId) {
         return;
       }
 
       try {
-        const snapshot = await fetchJson(`/api/runs/${runId}`);
-        syncBackendQueue(snapshot.queue || {});
-          applyRunSnapshot(snapshot);
-          if (snapshot.status === "completed" || snapshot.status === "failed" || snapshot.status === "cancelled") {
-            if (snapshot.status === "completed") {
-              activeWorkbenchModule.value = "result";
-              resetMainScroll();
-            } else {
-              showRunProgressTab();
-            }
+        const snapshot = await refreshRunSnapshot(runId);
+        if (snapshot && isTerminalRunStatus(snapshot.status)) {
+          if (snapshot.status === "completed") {
+            activeWorkbenchModule.value = "result";
+            resetMainScroll();
+          } else {
+            showRunProgressTab();
+          }
           window.clearInterval(pollTimer);
           pollTimer = null;
           refreshQueueAfterTerminal();
+          scheduleTerminalRunReconcile(runId);
         }
       } catch (error) {
         const message = error.message || "";
@@ -2163,7 +3861,7 @@ createApp({
               status: "stale",
               phase: "服务已重启，任务状态需重新运行",
               result_summary: "后端当前进程找不到该任务，通常是服务重启或浏览器历史残留。",
-              updated_at: new Date().toISOString(),
+              updated_at: localTimestamp(),
             });
             persistTaskHistory();
           }
@@ -2332,7 +4030,7 @@ createApp({
     function resetForm() {
       form.ticker = "BTC-USD";
       form.assetType = "crypto";
-      form.analysisDate = "2026-06-01";
+      form.analysisDate = localDateInputValue();
       form.outputLanguage = "Chinese";
       form.customLanguage = "";
       form.analysts = ["market", "social", "news"];
@@ -2353,8 +4051,10 @@ createApp({
       form.runReportEvaluation = false;
       form.reportReferencePath = "";
       form.reportTopic = "";
+      form.runBacktest = false;
       form.backtestInitialCapital = "100000";
       form.backtestHoldingDays = "5,10,20";
+      form.runAlphaMining = false;
       form.googleThinkingLevel = "high";
       form.openaiReasoningEffort = "medium";
       form.anthropicEffort = "high";
@@ -2402,6 +4102,24 @@ createApp({
       }
     );
 
+    watch(
+      () => paper.autoRefresh,
+      () => {
+        if (activeWorkbenchModule.value === "paper" || activeWorkbenchModule.value === "paper-future") {
+          startPaperPolling();
+        }
+      }
+    );
+
+    watch(
+      () => conclusions.selectedConclusionId,
+      () => {
+        if (activeWorkbenchModule.value === "conclusions") {
+          refreshObservationIntraday({ quiet: true });
+        }
+      }
+    );
+
     async function initializeWorkbench() {
       loadTaskHistory();
       if (taskHistory.value.length > 0) {
@@ -2420,6 +4138,14 @@ createApp({
       if (authState.authenticated) {
         await initializeWorkbench();
       }
+    });
+
+    onUnmounted(() => {
+      stopPaperPolling();
+      stopObservationPolling();
+      window.clearInterval(pollTimer);
+      window.clearTimeout(window.__taTerminalSnapshotTimer);
+      window.clearTimeout(window.__taTerminalHistoryTimer);
     });
 
     return {
@@ -2444,9 +4170,17 @@ createApp({
       checkHealth,
       checkpointState,
       clearDefaultParams,
-      copyAgentOutput,
+      addManualConclusion,
+      addSelectedRunConclusion,
+      conclusions,
+	      conclusionStatusLabel,
+	      scenarioLabel,
+	      simulationStateLabel,
+	      simulationTypeLabel,
+	      copyAgentOutput,
       commandPreview,
       deleteManagedUser,
+      deleteConclusion,
       downloadReport,
       exportAgentOutputs,
       exportCurrentConfig,
@@ -2458,8 +4192,10 @@ createApp({
       eventLabel,
       configPreview,
       filteredLogs,
+      formatLocalDateTime,
       currentDecisionDetails,
       currentRunningAgent,
+      currentPaperSignals,
       decisionResult,
       effectiveOutputLanguage,
       finalDecision,
@@ -2477,12 +4213,42 @@ createApp({
       historySearch,
       hasDecisionResult,
       healthState,
+      historicalPaperSignals,
+      loadConclusions,
       loadAlphaLibrary,
       loadServerHistory,
       loadPreset,
       logs,
       nextPendingAgent,
       outputLanguages,
+      paper,
+      isPaperFutureModule,
+      isPaperAccountModule,
+      isPaperReplayModule,
+      isPaperWorkbenchModule,
+      paperChartOptions,
+      paperConclusionTracks,
+      paperEpisodeSummary,
+      paperEpisodes,
+      paperInterfaceDescription,
+      paperInterfaceTitle,
+      paperFills,
+      paperLedgerFacetRows,
+      paperLedgerTitle,
+      paperModuleDescription,
+      paperModuleTitle,
+      paperChartTitle,
+      paperPositions,
+	      activeSimulationMeta,
+	      activeSimulationSourceCounts,
+	      activeSimulationSourceLabel,
+	      activeSimulationScenarioRows,
+	      activeSimulationSummary,
+      scopedPaperEpisodes,
+      observationTicker,
+      observationIntradayChart,
+      observationReturnChart,
+      selectedConclusionTrack,
       recentPresetStocks,
       providerOptions,
       providerLabel,
@@ -2504,6 +4270,21 @@ createApp({
       rerunWithoutCheckpoint,
       rerunHistoryItem,
       retryLastRun,
+      resetPaperAccount,
+      refreshObservationIntraday,
+      refreshPaperEpisodes,
+      refreshPaperTrading,
+      refreshPaperAnalytics,
+      replayManualHistoricalPaper,
+      updatePaperChartHover,
+      clearPaperChartHover,
+      updateObservationChartHover,
+      clearObservationChartHover,
+      submitPaperOrder,
+      submitForecastObservation,
+      reviewConclusion,
+      applyPaperSignal,
+      paperSignalSubmitLabel,
       runAnalysis,
       runMetrics,
       runState,
@@ -2520,6 +4301,11 @@ createApp({
       selectedAlphaView,
       selectedBacktestDetail,
       selectedBacktestView,
+      selectedPaperTradingView,
+      selectedPaperSnapshots,
+      selectedReplaySnapshots,
+      paperChart,
+      activePaperChart,
       statusLabel,
       startAuthSlider,
       submitAuth,
@@ -2658,7 +4444,7 @@ createApp({
         <header class="topbar">
           <div class="topbar-copy">
             <strong>{{ (workbenchModules.find((item) => item.id === activeWorkbenchModule) || {}).label || "工作台" }}</strong>
-            <span>{{ selectedTaskView.ticker || form.ticker }} · {{ selectedTaskView.status || "idle" }}</span>
+            <span>{{ selectedTaskView.ticker || form.ticker }} · {{ statusLabel(selectedTaskView.status || "idle") }}</span>
           </div>
           <div class="topbar-meta">
             <button type="button" class="mode-switch-button" @click="toggleSimpleMode">
@@ -2671,7 +4457,7 @@ createApp({
             </div>
             <button v-if="authState.isAdmin" type="button" class="ghost-button mini" @click="openUserAdmin">用户管理</button>
             <button type="button" class="ghost-button mini" @click="logout">退出</button>
-            <div class="build-tag">UI Build 2026-07-15S</div>
+            <div class="build-tag">UI Build 2026-07-20H</div>
           </div>
         </header>
 
@@ -2682,7 +4468,7 @@ createApp({
             </span>
             <div>
               <strong>{{ selectedTaskView.ticker || form.ticker }}</strong>
-              <small>{{ selectedTaskView.payload?.analysis_date || form.analysisDate }} · {{ selectedTaskView.status || "idle" }} · {{ selectedTaskView.elapsed || "00:00" }}</small>
+              <small>{{ selectedTaskView.payload?.analysis_date || form.analysisDate }} · {{ statusLabel(selectedTaskView.status || "idle") }} · {{ selectedTaskView.elapsed || "00:00" }}</small>
             </div>
           </div>
           <div class="current-run-progress">
@@ -2743,13 +4529,13 @@ createApp({
                   <strong>{{ item.ticker }}</strong>
                   <div class="history-head-meta">
                     <em>{{ selectedTaskRunId === item.run_id ? "查看中" : "查看结果" }}</em>
-                    <span :class="'status-' + (item.status || 'pending')">{{ item.status || 'pending' }}</span>
+                    <span :class="'status-' + (item.status || 'pending')">{{ statusLabel(item.status || 'pending') }}</span>
                   </div>
                 </button>
                 <p>{{ item.provider }} · {{ item.phase }}</p>
                 <div class="history-date-row">
                   <small>分析日期 {{ item.payload?.analysis_date || "N/A" }}</small>
-                  <small>运行时间 {{ item.updated_at || "N/A" }}</small>
+                  <small>运行时间 {{ formatLocalDateTime(item.updated_at) || "N/A" }}</small>
                 </div>
                 <small>{{ item.rating || "无评级" }}</small>
                 <small :class="item.checkpoint_available ? 'resume-ok' : 'resume-bad'">
@@ -2816,7 +4602,7 @@ createApp({
         </aside>
 
         <section
-          v-show="activeWorkbenchModule === 'run' || (simpleMode && activeWorkbenchModule === 'history')"
+          v-show="['run', 'params', 'agents', 'timeline', 'logs', 'result', 'report', 'conclusions', 'paper', 'paper-future', 'paper-replay'].includes(activeWorkbenchModule) || (simpleMode && activeWorkbenchModule === 'history')"
           class="work-column module-panel-main"
         >
           <section v-show="activeWorkbenchModule === 'run'" class="control-panel panel">
@@ -2884,7 +4670,7 @@ createApp({
             <div class="section-banner">
               <div>
                 <strong>Run Blueprint</strong>
-                <p>先选股票/币种、模型与语言，再决定是否附加回测、报告评估和完成后更新因子库。</p>
+                <p>先选股票/币种、模型与语言；模拟盘请在左侧独立模块中运行。</p>
               </div>
               <div class="banner-badges">
                 <span>{{ form.assetType }}</span>
@@ -3218,7 +5004,7 @@ createApp({
 
             <div class="field-group grouped-block collapsible">
             <button type="button" class="section-toggle" @click="toggleSection('extras')">
-              <span class="group-label">运行后附加功能</span>
+              <span class="group-label">运行后处理</span>
               <strong>{{ panelSections.extras ? "收起" : "展开" }}</strong>
             </button>
             <div v-if="panelSections.extras" class="switch-row">
@@ -3250,6 +5036,7 @@ createApp({
                 <span>持有天数</span>
                 <input v-model="form.backtestHoldingDays" type="text" placeholder="5,10,20">
               </label>
+
             </div>
           </div>
           </template>
@@ -3283,7 +5070,7 @@ createApp({
               >
                 <button type="button" class="simple-history-main" @click="selectTask(item.run_id)">
                   <strong>{{ item.ticker || "未命名任务" }}</strong>
-                  <span>{{ item.rating || item.status || "pending" }}</span>
+                  <span>{{ item.rating || statusLabel(item.status || "pending") }}</span>
                 </button>
                 <small>{{ item.payload?.analysis_date || "N/A" }} · {{ item.elapsed || "00:00" }}</small>
                 <button type="button" class="ghost-button mini" @click="rerunHistoryItem(item)">重跑</button>
@@ -3294,7 +5081,7 @@ createApp({
         </section>
 
         <section
-          v-show="['agents', 'result', 'timeline', 'logs', 'report', 'extras', 'params'].includes(activeWorkbenchModule)"
+          v-show="['agents', 'result', 'timeline', 'logs', 'report', 'conclusions', 'paper', 'paper-future', 'paper-replay', 'params'].includes(activeWorkbenchModule)"
           class="inspect-column module-panel-main"
         >
           <section class="result-panel">
@@ -3302,7 +5089,7 @@ createApp({
             <div class="selection-banner-copy">
               <span>当前查看任务</span>
               <strong>{{ selectedTaskView.ticker || form.ticker }}</strong>
-              <small>{{ selectedTaskView.payload?.analysis_date || form.analysisDate }} · {{ selectedTaskView.status || "idle" }}</small>
+              <small>{{ selectedTaskView.payload?.analysis_date || form.analysisDate }} · {{ statusLabel(selectedTaskView.status || "idle") }}</small>
             </div>
             <div v-if="!simpleMode" class="selection-banner-meta">
               <span>{{ selectedTaskView.payload?.llm_provider || form.llmProvider }}</span>
@@ -3354,7 +5141,7 @@ createApp({
           </article>
 
           <article
-            v-show="['result', 'timeline', 'logs', 'report', 'extras', 'params'].includes(activeWorkbenchModule)"
+            v-show="['result', 'timeline', 'logs', 'report', 'conclusions', 'paper', 'paper-future', 'paper-replay', 'params'].includes(activeWorkbenchModule)"
             class="panel"
           >
             <div v-if="activeWorkbenchModule === 'params'" class="config-preview">
@@ -3577,6 +5364,10 @@ createApp({
                 v-if="!currentDecisionDetails.executive_summary && !currentDecisionDetails.investment_thesis"
                 class="decision-summary-text"
               >{{ decisionResult.summary }}</p>
+              <div v-if="(selectedTaskView.attachments || {}).evaluation_enabled" class="decision-evaluation-panel">
+                <span>报告评估</span>
+                <strong>{{ (selectedTaskView.attachments || {}).evaluation_summary || "等待评估结果" }}</strong>
+              </div>
               <div v-if="(selectedTaskView.attachments || {}).data_diagnostic" class="error-diagnostic data-diagnostic">
                 <strong>数据诊断 / 处理意见</strong>
                 <p>{{ (selectedTaskView.attachments || {}).data_diagnostic }}</p>
@@ -3625,118 +5416,964 @@ createApp({
               </div>
             </div>
 
-            <div v-else-if="activeWorkbenchModule === 'extras'" class="feature-summary">
-              <div class="feature-grid">
-                <article class="feature-card">
-                  <span>报告保存</span>
-                  <strong>{{ (selectedTaskView.attachments || {}).report_saved ? "已启用" : "未启用" }}</strong>
-                  <p>{{ (selectedTaskView.attachments || {}).report_path || "无" }}</p>
-                  <button
-                    type="button"
-                    class="ghost-button mini"
-                    :disabled="!(selectedTaskView.attachments || {}).report_saved"
-                    @click="downloadReport"
-                  >
-                    下载报告
-                  </button>
-                </article>
-                <article class="feature-card">
-                  <span>报告评估</span>
-                  <strong>{{ (selectedTaskView.attachments || {}).evaluation_enabled ? "已启用" : "未启用" }}</strong>
-                  <p>{{ (selectedTaskView.attachments || {}).evaluation_summary || "无" }}</p>
-                </article>
-                <article class="feature-card feature-wide">
-                  <span>Backtest</span>
-                  <strong>{{ (selectedTaskView.attachments || {}).backtest_enabled ? "已启用" : "未启用" }}</strong>
-                  <p>{{ (selectedTaskView.attachments || {}).backtest_summary || "无" }}</p>
-                  <div v-if="selectedBacktestDetail.length" class="feature-detail">
-                    <label class="field full">
-                      <span>回测结果视图</span>
-                      <select v-model="selectedBacktestView">
-                        <option value="overview">Overview</option>
-                        <option value="trades">Trades</option>
-                        <option value="raw">Raw JSON</option>
+            <div v-else-if="activeWorkbenchModule === 'conclusions'" class="conclusion-dashboard">
+              <section class="conclusion-main-panel">
+                <div class="section-title-row">
+                  <div>
+                    <h3>长期观察</h3>
+                    <p>统一管理推演模拟盘、历史回测、纸面账户和真实行情的复盘对照。</p>
+                  </div>
+                  <div class="inline-actions">
+                    <button type="button" class="ghost-button mini" :disabled="conclusions.loading" @click="loadConclusions">
+                      {{ conclusions.loading ? "刷新中" : "刷新结论" }}
+                    </button>
+                    <button type="button" class="primary-button compact" :disabled="!selectedTaskView.run_id" @click="addSelectedRunConclusion">
+                      当前任务入池
+                    </button>
+                  </div>
+                </div>
+                <div v-if="conclusions.error" class="error-diagnostic">
+                  <strong>研究跟踪盘错误</strong>
+                  <p>{{ conclusions.error }}</p>
+                </div>
+                <div class="refresh-policy-strip">
+                  <span><b>收益对照曲线</b>随结论同步刷新</span>
+                  <span><b>结论列表 / 生命周期</b>5 分钟自动同步</span>
+                  <span><b>Agent 重新分析</b>手动触发</span>
+                </div>
+                <div class="paper-account-summary">
+                  <article>
+                    <span>结论总数</span>
+                    <strong>{{ conclusions.summary?.track_total || 0 }}</strong>
+                  </article>
+                  <article>
+                    <span>跟踪中</span>
+                    <strong>{{ conclusions.summary?.status_counts?.tracking || 0 }}</strong>
+                  </article>
+                  <article>
+                    <span>待复盘</span>
+                    <strong>{{ conclusions.summary?.status_counts?.due_review || 0 }}</strong>
+                  </article>
+                  <article>
+                    <span>正收益率</span>
+                    <strong>{{ formatPercent(conclusions.summary?.positive_return_rate) }}</strong>
+                  </article>
+                  <article>
+                    <span>结论同步</span>
+                    <strong>{{ conclusions.lifecycleLastUpdated || "未同步" }}</strong>
+                  </article>
+                </div>
+                <div class="paper-chart-card observation-chart-card">
+                  <div class="paper-chart-head">
+                    <strong>{{ observationTicker || "N/A" }} 收益对照曲线</strong>
+                    <div class="chart-range-tools">
+                      <select v-model="conclusions.chartRange" aria-label="长期观察曲线范围">
+                        <option value="today">今天</option>
+                        <option value="7d">近 7 天</option>
+                        <option value="30d">近 30 天</option>
+                        <option value="all">全部</option>
+                        <option value="custom">自定义</option>
                       </select>
-                    </label>
-                    <div v-if="selectedBacktestView === 'overview'" class="metric-table">
-                      <div class="metric-row metric-head">
-                        <span>Days</span>
-                        <span>Return</span>
-                        <span>Alpha</span>
-                        <span>Win</span>
-                        <span>Sharpe</span>
-                        <span>Drawdown</span>
-                      </div>
-                      <div v-for="item in selectedBacktestDetail" :key="item.holding_days" class="metric-row">
-                        <span>{{ item.holding_days }}d</span>
-                        <span>{{ item.resolved ? formatPercent(item.trade?.executed_return) : "No data" }}</span>
-                        <span>{{ item.resolved ? formatPercent(item.trade?.executed_alpha_return) : "No data" }}</span>
-                        <span>{{ item.resolved ? formatPercent(item.metrics?.win_rate) : "No data" }}</span>
-                        <span>{{ item.resolved ? formatNumber(item.metrics?.sharpe_ratio, 4) : "No data" }}</span>
-                        <span>{{ item.resolved ? formatPercent(item.metrics?.max_drawdown) : "No data" }}</span>
+                      <input v-if="conclusions.chartRange === 'custom'" v-model="conclusions.chartStartDate" type="date" aria-label="长期观察开始日期">
+                      <input v-if="conclusions.chartRange === 'custom'" v-model="conclusions.chartEndDate" type="date" aria-label="长期观察结束日期">
+                      <button type="button" class="ghost-button mini" :disabled="conclusions.quoteLoading" @click="refreshObservationIntraday">
+                        {{ conclusions.quoteLoading ? "刷新中" : "刷新价格" }}
+                      </button>
+                    </div>
+                  </div>
+                  <div class="paper-live-metrics observation-live-metrics">
+                    <article>
+                      <span>最新价</span>
+                      <strong>{{ formatNumber(conclusions.quote?.price, 4) }}</strong>
+                      <small>{{ conclusions.quote?.as_of || "N/A" }}</small>
+                    </article>
+                    <article>
+                      <span>当日变化</span>
+                      <strong>{{ formatPercent(conclusions.quote?.change_percent) }}</strong>
+                      <small>{{ formatNumber(conclusions.quote?.change, 4) }}</small>
+                    </article>
+                    <article>
+                      <span>选中结论</span>
+                      <strong>{{ selectedConclusionTrack?.rating || selectedConclusionTrack?.action || "N/A" }}</strong>
+                      <small>{{ observationReturnChart.series[0]?.pointItems?.length || 0 }} points</small>
+                    </article>
+                  </div>
+                  <svg
+                    viewBox="0 0 700 280"
+                    role="img"
+                    aria-label="长期观察收益对照曲线"
+                    @mousemove="updateObservationChartHover"
+                    @mouseleave="clearObservationChartHover"
+                  >
+                    <line
+                      v-for="tick in observationReturnChart.axis.yTicks"
+                      :key="'observe-grid-' + tick.y"
+                      :x1="observationReturnChart.axis.x1"
+                      :y1="tick.y"
+                      :x2="observationReturnChart.axis.x2"
+                      :y2="tick.y"
+                      class="paper-grid-line"
+                    ></line>
+                    <line :x1="observationReturnChart.axis.x1" :y1="observationReturnChart.axis.y2" :x2="observationReturnChart.axis.x2" :y2="observationReturnChart.axis.y2" class="paper-axis"></line>
+                    <line :x1="observationReturnChart.axis.x1" :y1="observationReturnChart.axis.y1" :x2="observationReturnChart.axis.x1" :y2="observationReturnChart.axis.y2" class="paper-axis"></line>
+                    <text
+                      v-for="tick in observationReturnChart.axis.yTicks"
+                      :key="'observe-ytick-' + tick.y"
+                      :x="observationReturnChart.axis.x1 - 8"
+                      :y="tick.y + 4"
+                      text-anchor="end"
+                      class="paper-axis-label"
+                    >{{ tick.label }}</text>
+                    <text
+                      v-for="label in observationReturnChart.axis.xLabels"
+                      :key="'observe-xlabel-' + label.x + label.label"
+                      :x="label.x"
+                      :y="observationReturnChart.axis.y2 + 20"
+                      :text-anchor="label.anchor || 'middle'"
+                      class="paper-axis-label"
+                    >{{ label.label }}</text>
+                    <polyline
+                      v-for="series in observationReturnChart.series"
+                      :key="'observe-' + series.key"
+                      :points="series.points"
+                      :class="['paper-chart-line', 'paper-chart-line-' + series.key]"
+                    ></polyline>
+                    <line
+                      v-if="conclusions.chartHover"
+                      :x1="conclusions.chartHover.x"
+                      :y1="observationReturnChart.axis.y1"
+                      :x2="conclusions.chartHover.x"
+                      :y2="observationReturnChart.axis.y2"
+                      class="paper-hover-line"
+                    ></line>
+                    <circle
+                      v-for="item in (conclusions.chartHover?.items || [])"
+                      :key="'observe-hover-' + item.key"
+                      :cx="item.x"
+                      :cy="item.y"
+                      r="4"
+                      :class="['paper-hover-dot', 'paper-chart-dot-' + item.key]"
+                    ></circle>
+                    <text v-if="!observationReturnChart.series.length" x="350" y="104" text-anchor="middle" class="paper-chart-empty">运行或选择推演记录后显示收益对照</text>
+                  </svg>
+                  <div class="paper-chart-legend" v-if="observationReturnChart.series.length">
+                    <span v-for="series in observationReturnChart.series" :key="'observe-legend-' + series.key">
+                      <i :class="['paper-chart-dot', 'paper-chart-dot-' + series.key]"></i>
+                      {{ series.label }} {{ formatPercent(series.latest) }}
+                    </span>
+                  </div>
+                  <div v-if="conclusions.chartHover" class="paper-chart-hover-readout">
+                    <strong>{{ conclusions.chartHover.date || "N/A" }}</strong>
+                    <span v-for="item in conclusions.chartHover.items" :key="'observe-readout-' + item.key">
+                      {{ item.label }} {{ formatPercent(item.value) }}
+                    </span>
+                  </div>
+                </div>
+                <div class="conclusion-track-grid">
+                  <div class="alpha-section-head">
+                    <strong>结论生命周期</strong>
+                    <small>状态慢同步，复盘动作手动确认</small>
+                  </div>
+                  <article
+                    v-for="track in conclusions.items"
+                    :key="track.conclusion_id"
+                    :class="['paper-track-card', 'conclusion-track-card', { active: track.conclusion_id === conclusions.selectedConclusionId }]"
+                    @click="conclusions.selectedConclusionId = track.conclusion_id"
+                  >
+                    <div class="history-head">
+                      <strong>{{ track.ticker }}</strong>
+                      <div class="history-head-meta">
+                        <span>{{ conclusionStatusLabel(track.status) }}</span>
+                        <span>{{ track.rating || track.action || "Manual" }}</span>
                       </div>
                     </div>
-                    <div v-else-if="selectedBacktestView === 'trades'" class="detail-stack">
-                      <div v-for="item in selectedBacktestDetail" :key="item.holding_days" class="detail-card">
-                        <strong>{{ item.holding_days }}d</strong>
-                        <p v-if="!item.resolved">{{ item.reason || "未解析到可回测交易或未来价格数据。" }}</p>
-                        <div v-else class="kv-grid">
-                          <span>Action</span><b>{{ item.trade?.action || "N/A" }}</b>
-                          <span>Rating</span><b>{{ item.trade?.rating || "N/A" }}</b>
-                          <span>Position</span><b>{{ formatPercent(item.trade?.target_position_size) }}</b>
-                          <span>Capital</span><b>{{ formatNumber(item.trade?.ending_capital) }}</b>
-                          <span>Benchmark</span><b>{{ item.trade?.benchmark || "N/A" }}</b>
-                          <span>Confidence</span><b>{{ formatPercent(item.trade?.confidence) }}</b>
+                    <p>{{ track.thesis || "暂无结论摘要。" }}</p>
+                    <div class="paper-track-progress">
+                      <span :style="{ width: formatPercent(track.progress) }"></span>
+                    </div>
+                    <small>
+                      {{ track.age_days }}/{{ track.horizon_days }} 天 · 当前收益 {{ formatPercent(track.current_return) }} · 目标仓位 {{ formatPercent(track.target_position_size) }}
+	                    </small>
+	                    <small>来源 {{ track.source_run_id || "manual" }} · {{ track.analysis_date || String(track.opened_at || '').slice(0, 10) }}</small>
+	                    <small>
+	                      模拟 {{ formatPercent(track.simulation_return) }} · 真实 {{ formatPercent(track.actual_return) }}
+	                      · 偏差 {{ formatPercent(track.simulation_deviation) }} · 命中 {{ formatPercent(track.hit_rate) }}
+	                    </small>
+	                    <small v-if="track.review_conclusion">{{ track.review_conclusion }}</small>
+	                    <small v-if="track.comparison?.price_source_counts || track.comparison?.simulation_summary">
+                      真实 {{ track.comparison?.price_source_counts?.real || 0 }} 点 · 模拟 {{ track.comparison?.price_source_counts?.simulated || 0 }} 点
+	                      · 中位 {{ formatPercent(track.comparison?.simulation_summary?.quantiles?.p50) }}
+                    </small>
+                    <textarea
+                      v-model="conclusions.reviewNotes[track.conclusion_id]"
+                      rows="2"
+                      placeholder="复盘备注"
+                    ></textarea>
+                    <div class="history-actions">
+                      <button type="button" class="ghost-button mini" @click="reviewConclusion(track, 'validated')">验证有效</button>
+                      <button type="button" class="ghost-button mini" @click="reviewConclusion(track, 'invalidated')">标记失效</button>
+                      <button type="button" class="ghost-button mini" @click="reviewConclusion(track, 'tracking')">继续跟踪</button>
+                      <button type="button" class="ghost-button mini danger-button" @click="reviewConclusion(track, 'archived')">归档</button>
+                      <button type="button" class="ghost-button mini danger-button" @click="deleteConclusion(track)">删除</button>
+                    </div>
+                  </article>
+                  <div v-if="!conclusions.items.length" class="placeholder-block">
+                    <strong>还没有研究结论入池</strong>
+                    <p>可以从当前任务入池，也可以手动添加一个只观察、不下单的长期观察结论。</p>
+                  </div>
+                </div>
+              </section>
+              <aside class="conclusion-side-panel">
+                <article class="paper-interface-card">
+                  <div class="section-title-row">
+                    <div>
+                      <h3>手动加入观察</h3>
+                      <p>用于跟踪暂不交易、被风控拦截或来自外部研究的结论。</p>
+                    </div>
+                  </div>
+                  <div class="paper-order-grid">
+                    <label class="field">
+                      <span>标的</span>
+                      <input v-model="conclusions.form.ticker" type="text" :placeholder="form.ticker">
+                    </label>
+                    <label class="field">
+                      <span>资产类型</span>
+                      <select v-model="conclusions.form.assetType">
+                        <option value="stock">stock</option>
+                        <option value="crypto">crypto</option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span>评级</span>
+                      <input v-model="conclusions.form.rating" type="text" placeholder="Buy / Hold / Manual">
+                    </label>
+                    <label class="field">
+                      <span>动作</span>
+                      <select v-model="conclusions.form.action">
+                        <option value="buy">buy</option>
+                        <option value="overweight">overweight</option>
+                        <option value="hold">hold</option>
+                        <option value="underweight">underweight</option>
+                        <option value="sell">sell</option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span>目标仓位</span>
+                      <input v-model="conclusions.form.targetPositionSize" type="text" placeholder="0.10">
+                    </label>
+                    <label class="field">
+                      <span>观察周期(天)</span>
+                      <input v-model="conclusions.form.horizonDays" type="text" placeholder="20">
+                    </label>
+                  </div>
+                  <label class="field full">
+                    <span>核心论点</span>
+                    <textarea v-model="conclusions.form.thesis" rows="4" placeholder="这条结论为什么值得长期观察"></textarea>
+                  </label>
+                  <button type="button" class="primary-button" @click="addManualConclusion">加入研究跟踪盘</button>
+                </article>
+              </aside>
+            </div>
+
+            <div v-else-if="isPaperWorkbenchModule" class="paper-dashboard">
+              <section class="paper-live-panel">
+                <div class="section-title-row">
+                  <div>
+	                    <h3>{{ paperModuleTitle }}</h3>
+	                    <p>{{ paperModuleDescription }}</p>
+                  </div>
+                  <button type="button" class="ghost-button mini" :disabled="paper.loading" @click="refreshPaperTrading">
+                    {{ paper.loading ? "刷新中" : (isPaperReplayModule ? "加载信号" : "刷新") }}
+                  </button>
+                </div>
+                <div class="paper-symbol-row">
+                  <label class="field">
+                    <span>标的</span>
+                    <input v-model="paper.ticker" type="text" placeholder="BTC-USD / AAPL / 300308.SZ">
+                  </label>
+                  <label class="field">
+                    <span>资产类型</span>
+                    <select v-model="paper.assetType">
+                      <option value="stock">stock</option>
+                      <option value="crypto">crypto</option>
+                    </select>
+                  </label>
+                  <label v-if="isPaperFutureModule || isPaperAccountModule" class="paper-autorefresh">
+                    <input v-model="paper.autoRefresh" type="checkbox">
+                    <span>15s 自动刷新</span>
+                  </label>
+                </div>
+                <div class="refresh-policy-strip">
+                  <span v-if="isPaperReplayModule"><b>历史回测</b>手动运行</span>
+                  <span v-else><b>价格 / 估值 / 曲线</b>15 秒自动刷新</span>
+                  <span v-if="isPaperFutureModule"><b>推演模拟盘</b>按起点运行</span>
+                  <span v-if="isPaperAccountModule"><b>纸面账户</b>手动下单</span>
+                  <span><b>Agent 重新分析 / 推演</b>手动触发</span>
+                </div>
+                <div v-if="paper.error" class="error-diagnostic">
+                  <strong>模拟盘错误</strong>
+                  <p>{{ paper.error }}</p>
+                </div>
+                <div v-if="isPaperFutureModule || isPaperAccountModule" class="paper-live-metrics">
+                  <article>
+                    <span>最新价</span>
+                    <strong>{{ formatNumber(paper.quote?.price, 4) }}</strong>
+                    <small>{{ paper.quote?.as_of || "N/A" }}</small>
+                  </article>
+                  <article>
+                    <span>涨跌幅</span>
+                    <strong>{{ formatPercent(paper.quote?.change_percent) }}</strong>
+                    <small>{{ formatNumber(paper.quote?.change, 4) }}</small>
+                  </article>
+                  <article>
+                    <span>{{ isPaperAccountModule ? "账户权益" : "推演状态" }}</span>
+                    <strong>{{ isPaperAccountModule ? formatNumber(paper.account?.equity) : (paper.forecastResult?.track ? "已入池" : "待创建") }}</strong>
+                    <small>{{ isPaperAccountModule ? ("收益 " + formatPercent(paper.account?.total_return)) : (paper.forecastResult?.track?.conclusion_id || "长期观察复盘") }}</small>
+                  </article>
+                  <article>
+                    <span>{{ isPaperAccountModule ? "现金" : "纸面同步" }}</span>
+                    <strong>{{ isPaperAccountModule ? formatNumber(paper.account?.cash) : (paper.executePaperAccount ? "开启" : "关闭") }}</strong>
+                    <small>{{ paper.lastUpdated || "未刷新" }}</small>
+                  </article>
+                </div>
+                <div v-else class="paper-live-metrics">
+                  <article>
+                    <span>回测标的</span>
+                    <strong>{{ paper.replayTicker || paper.ticker }}</strong>
+                    <small>{{ paper.replayTradeDate || "未选择日期" }}</small>
+                  </article>
+                  <article>
+                    <span>回测周期</span>
+                    <strong>{{ paper.replayHorizonDays || "20" }} 天</strong>
+                    <small>{{ paper.replayAction }} · {{ formatPercent(paper.replayTargetPositionSize) }}</small>
+                  </article>
+                  <article>
+                    <span>最终权益</span>
+                    <strong>{{ formatNumber((paper.replayResult?.final_snapshot || {}).equity || paper.replayAccount?.equity) }}</strong>
+                    <small>return {{ formatPercent(paper.replayResult?.final_return) }}</small>
+                  </article>
+                  <article>
+                    <span>回测更新时间</span>
+                    <strong>{{ paper.replayLastUpdated || "未运行" }}</strong>
+                    <small>{{ selectedReplaySnapshots.length }} snapshots</small>
+                  </article>
+                </div>
+	                <div class="paper-chart-card" :class="{ 'paper-chart-card-fullscreen': paper.chartFullscreen }">
+	                  <div class="paper-chart-head">
+	                    <strong>{{ paperChartTitle }}</strong>
+	                    <div v-if="isPaperAccountModule" class="paper-chart-tools">
+	                      <div class="chart-range-tools">
+	                        <select v-model="paper.chartRange" aria-label="纸面账户曲线范围">
+	                          <option value="today">今天</option>
+	                          <option value="7d">近 7 天</option>
+	                          <option value="30d">近 30 天</option>
+	                          <option value="all">全部</option>
+	                          <option value="custom">自定义</option>
+	                        </select>
+	                        <input v-if="paper.chartRange === 'custom'" v-model="paper.chartStartDate" type="date" aria-label="纸面账户开始日期">
+	                        <input v-if="paper.chartRange === 'custom'" v-model="paper.chartEndDate" type="date" aria-label="纸面账户结束日期">
+	                      </div>
+	                      <div class="paper-chart-toggles" role="group" aria-label="选择纸面账户曲线">
+	                        <label v-for="option in paperChartOptions" :key="option.key">
+	                          <input v-model="paper.chartSeries[option.key]" type="checkbox">
+	                          <span>{{ option.label }}</span>
+	                        </label>
+	                        <button type="button" class="ghost-button mini" @click="paper.chartFullscreen = !paper.chartFullscreen">
+	                          {{ paper.chartFullscreen ? "退出全屏" : "全屏" }}
+	                        </button>
+	                      </div>
+	                    </div>
+		                  </div>
+			                  <svg
+	                    viewBox="0 0 700 280"
+	                    role="img"
+	                    aria-label="模拟盘权益曲线"
+	                    @mousemove="updatePaperChartHover"
+	                    @mouseleave="clearPaperChartHover"
+	                  >
+	                    <line
+	                      v-for="tick in activePaperChart.axis.yTicks"
+	                      :key="'grid-' + tick.y"
+	                      :x1="activePaperChart.axis.x1"
+	                      :y1="tick.y"
+	                      :x2="activePaperChart.axis.x2"
+	                      :y2="tick.y"
+	                      class="paper-grid-line"
+	                    ></line>
+	                    <line :x1="activePaperChart.axis.x1" :y1="activePaperChart.axis.y2" :x2="activePaperChart.axis.x2" :y2="activePaperChart.axis.y2" class="paper-axis"></line>
+	                    <line :x1="activePaperChart.axis.x1" :y1="activePaperChart.axis.y1" :x2="activePaperChart.axis.x1" :y2="activePaperChart.axis.y2" class="paper-axis"></line>
+	                    <text
+	                      v-for="tick in activePaperChart.axis.yTicks"
+	                      :key="'ytick-' + tick.y"
+	                      :x="activePaperChart.axis.x1 - 8"
+	                      :y="tick.y + 4"
+	                      text-anchor="end"
+	                      class="paper-axis-label"
+	                    >{{ tick.label }}</text>
+	                    <text
+	                      v-for="label in activePaperChart.axis.xLabels"
+	                      :key="'xlabel-' + label.x + label.label"
+	                      :x="label.x"
+	                      :y="activePaperChart.axis.y2 + 20"
+	                      :text-anchor="label.anchor || 'middle'"
+	                      class="paper-axis-label"
+		                    >{{ label.label }}</text>
+		                    <text :x="activePaperChart.axis.x1" y="12" class="paper-axis-title">{{ activePaperChart.axis.label }}</text>
+		                    <polygon
+		                      v-if="activePaperChart.bandPoints"
+		                      :points="activePaperChart.bandPoints"
+		                      class="paper-quantile-band"
+		                    ></polygon>
+		                    <polyline
+		                      v-if="activePaperChart.lowerPoints"
+		                      :points="activePaperChart.lowerPoints"
+		                      class="paper-quantile-bound"
+		                    ></polyline>
+		                    <polyline
+		                      v-if="activePaperChart.upperPoints"
+		                      :points="activePaperChart.upperPoints"
+		                      class="paper-quantile-bound"
+		                    ></polyline>
+		                    <polyline
+		                      v-for="series in activePaperChart.series"
+	                      :key="series.key"
+	                      :points="series.points"
+	                      :class="['paper-chart-line', 'paper-chart-line-' + series.key]"
+	                    ></polyline>
+	                    <line
+	                      v-if="paper.chartHover"
+	                      :x1="paper.chartHover.x"
+	                      :y1="activePaperChart.axis.y1"
+	                      :x2="paper.chartHover.x"
+	                      :y2="activePaperChart.axis.y2"
+	                      class="paper-hover-line"
+	                    ></line>
+	                    <circle
+	                      v-for="item in (paper.chartHover?.items || [])"
+	                      :key="'hover-' + item.key"
+	                      :cx="item.x"
+	                      :cy="item.y"
+	                      r="4"
+	                      :class="['paper-hover-dot', 'paper-chart-dot-' + item.key]"
+	                    ></circle>
+	                    <text v-if="!activePaperChart.series.length" x="350" y="132" text-anchor="middle" class="paper-chart-empty">{{ isPaperReplayModule ? "运行历史回测后显示回测曲线" : "选择曲线后显示" }}</text>
+	                  </svg>
+	                  <div class="paper-chart-legend" v-if="activePaperChart.series.length">
+                    <span v-for="series in activePaperChart.series" :key="series.key">
+                      <i :class="['paper-chart-dot', 'paper-chart-dot-' + series.key]"></i>
+	                      {{ series.label }} {{ formatNumber(series.latest, series.decimals) }}
+	                    </span>
+	                  </div>
+	                  <div v-if="paper.chartHover" class="paper-chart-hover-readout">
+	                    <strong>{{ paper.chartHover.date || "N/A" }}</strong>
+	                    <span v-for="item in paper.chartHover.items" :key="'readout-' + item.key">
+	                      {{ item.label }} {{ formatNumber(item.value, item.decimals) }}
+	                    </span>
+	                  </div>
+	                </div>
+                <div v-if="isPaperAccountModule" class="paper-snapshot-list">
+                  <div class="metric-row paper-snapshot-row metric-head">
+                    <span>Time</span>
+                    <span>Equity</span>
+                    <span>Return</span>
+                    <span>Cash</span>
+                  </div>
+                  <div v-for="snapshot in selectedPaperSnapshots.slice(-6)" :key="snapshot.trade_date" class="metric-row paper-snapshot-row">
+                    <span>{{ formatLocalDateTime(snapshot.trade_date) }}</span>
+                    <span>{{ formatNumber(snapshot.equity) }}</span>
+                    <span>{{ formatPercent(snapshot.total_return) }}</span>
+                    <span>{{ formatNumber(snapshot.cash) }}</span>
+                  </div>
+                </div>
+                <div v-else-if="isPaperReplayModule" class="paper-snapshot-list">
+                  <div class="metric-row paper-snapshot-row metric-head">
+                    <span>Time</span>
+                    <span>Equity</span>
+                    <span>Return</span>
+                    <span>Cash</span>
+                  </div>
+                  <p v-if="!selectedReplaySnapshots.length">运行右侧历史回测后，这里会显示回放快照。</p>
+                  <div v-for="snapshot in selectedReplaySnapshots.slice(-12)" :key="'replay-main-' + snapshot.trade_date" class="metric-row paper-snapshot-row">
+                    <span>{{ formatLocalDateTime(snapshot.trade_date) }}</span>
+                    <span>{{ formatNumber(snapshot.equity) }}</span>
+                    <span>{{ formatPercent(snapshot.total_return) }}</span>
+                    <span>{{ formatNumber(snapshot.cash) }}</span>
+                  </div>
+                </div>
+                <div v-else class="paper-snapshot-list">
+                  <div class="metric-row paper-snapshot-row metric-head">
+                    <span>对象</span>
+                    <span>状态</span>
+                    <span>周期</span>
+                    <span>收益</span>
+                  </div>
+                  <p v-if="!paper.forecastResult?.episode">运行推演模拟盘后，这里会显示入池记录。</p>
+                  <div v-if="paper.forecastResult?.episode" class="metric-row paper-snapshot-row">
+                    <span>{{ paper.forecastResult.episode.ticker }}</span>
+                  <span>{{ simulationStateLabel(paper.forecastResult.data_mode || paper.forecastResult.episode.status) }}</span>
+                    <span>{{ paper.forecastResult.episode.horizon_days }} 天</span>
+                    <span>{{ formatPercent(paper.forecastResult.episode.strategy_return) }}</span>
+	                  </div>
+	                  <div v-if="paper.forecastResult?.episode" class="refresh-policy-strip">
+	                    <span><b>数据来源</b>{{ activeSimulationSourceLabel }}</span>
+	                    <span><b>情景</b>{{ scenarioLabel(activeSimulationMeta.scenario || "base") }}</span>
+	                    <span><b>路径数</b>{{ activeSimulationSummary.paths || activeSimulationMeta.num_paths || 0 }}</span>
+	                  </div>
+                  <div v-if="activeSimulationSummary.quantiles" class="kv-grid">
+                    <span>低位 P10</span><b>{{ formatPercent(activeSimulationSummary.quantiles.p10) }}</b>
+		                    <span>中位 P50</span><b>{{ formatPercent(activeSimulationSummary.quantiles.p50) }}</b>
+		                    <span>高位 P90</span><b>{{ formatPercent(activeSimulationSummary.quantiles.p90) }}</b>
+	                  </div>
+	                  <div v-if="activeSimulationScenarioRows.length" class="paper-scenario-table">
+	                    <div class="metric-row paper-scenario-row metric-head">
+	                      <span>情景</span>
+	                      <span>低位</span>
+	                      <span>中位</span>
+	                      <span>高位</span>
+	                      <span>路径</span>
+	                    </div>
+	                    <div
+	                      v-for="row in activeSimulationScenarioRows"
+	                      :key="'scenario-' + row.name"
+	                      class="metric-row paper-scenario-row"
+	                    >
+	                      <span>{{ row.label }}</span>
+	                      <span>{{ formatPercent(row.p10) }}</span>
+	                      <span>{{ formatPercent(row.p50) }}</span>
+	                      <span>{{ formatPercent(row.p90) }}</span>
+	                      <span>{{ row.paths }}</span>
+	                    </div>
+	                  </div>
+	                </div>
+              </section>
+
+              <aside class="paper-side-panel">
+                <article class="paper-interface-card">
+                  <div class="section-title-row">
+                    <div>
+	                    <h3>{{ paperInterfaceTitle }}</h3>
+	                    <p>{{ paperInterfaceDescription }}</p>
+                    </div>
+                    <div v-if="isPaperAccountModule" class="paper-reset-tools">
+                      <input v-model="paper.initialCash" type="text" aria-label="初始资金">
+                      <button type="button" class="ghost-button mini" @click="resetPaperAccount">重置账户</button>
+                    </div>
+                  </div>
+                  <div class="paper-view-tabs">
+                    <button type="button" :class="{ active: selectedPaperTradingView === 'overview' }" @click="selectedPaperTradingView = 'overview'">{{ isPaperReplayModule ? "回测" : "推演" }}</button>
+                    <button v-if="isPaperAccountModule" type="button" :class="{ active: selectedPaperTradingView === 'account' }" @click="selectedPaperTradingView = 'account'">账户</button>
+                    <button v-if="isPaperAccountModule" type="button" :class="{ active: selectedPaperTradingView === 'analytics' }" @click="selectedPaperTradingView = 'analytics'">绩效</button>
+                    <button type="button" :class="{ active: selectedPaperTradingView === 'ledger' }" @click="selectedPaperTradingView = 'ledger'">账本</button>
+                    <button v-if="isPaperAccountModule" type="button" :class="{ active: selectedPaperTradingView === 'fills' }" @click="selectedPaperTradingView = 'fills'">成交</button>
+                    <button v-if="isPaperAccountModule" type="button" :class="{ active: selectedPaperTradingView === 'positions' }" @click="selectedPaperTradingView = 'positions'">持仓</button>
+                    <button type="button" :class="{ active: selectedPaperTradingView === 'api' }" @click="selectedPaperTradingView = 'api'">接口</button>
+                  </div>
+	                  <div v-if="selectedPaperTradingView === 'overview'" class="detail-stack">
+                    <section v-if="isPaperFutureModule || isPaperAccountModule" class="paper-flow-section">
+                      <div class="section-title-row">
+                        <div>
+                          <h3>{{ isPaperAccountModule ? "纸面账户执行" : "推演模拟盘" }}</h3>
+                          <p>{{ isPaperAccountModule ? "先确认 execution_plan 或手动假设，再写入纸面账户；后续刷新行情和账户估值。" : "记录当前判断、入场价格和观察周期，后续在长期观察中与真实行情对照。" }}</p>
                         </div>
                       </div>
+	                    <div class="paper-order-grid">
+                        <label class="field">
+                          <span>动作</span>
+                          <select v-model="paper.action">
+                            <option value="buy">buy</option>
+                            <option value="overweight">overweight</option>
+                            <option value="hold">hold</option>
+                            <option value="underweight">underweight</option>
+                            <option value="sell">sell</option>
+                          </select>
+                        </label>
+	                      <label class="field">
+	                        <span>目标仓位</span>
+	                        <input v-model="paper.targetPositionSize" type="text" placeholder="0.10">
+	                      </label>
+	                      <label class="field">
+	                        <span>观察周期(天)</span>
+	                        <input v-model="paper.horizonDays" type="text" placeholder="20">
+	                      </label>
+                        <label v-if="isPaperFutureModule" class="field">
+                          <span>观察起点</span>
+                          <input v-model="paper.forecastAnalysisDate" type="date">
+                        </label>
+                        <label v-if="isPaperFutureModule" class="field">
+                          <span>入场价</span>
+                          <input v-model="paper.forecastEntryPrice" type="text" placeholder="空则使用最新价">
+                        </label>
+                        <label v-if="isPaperFutureModule" class="field">
+                          <span>模拟情景</span>
+                          <select v-model="paper.simulationScenario">
+                            <option value="base">基准</option>
+                            <option value="bull">乐观</option>
+                            <option value="bear">悲观</option>
+                            <option value="stress">压力</option>
+                          </select>
+                        </label>
+                        <label v-if="isPaperFutureModule" class="field">
+                          <span>日波动率</span>
+                          <input v-model="paper.simulationVolatility" type="text" placeholder="空则按历史估计">
+                        </label>
+                        <label v-if="isPaperFutureModule" class="field">
+                          <span>日趋势偏移</span>
+                          <input v-model="paper.simulationDrift" type="text" placeholder="空则按历史估计">
+                        </label>
+                        <label v-if="isPaperFutureModule" class="field">
+                          <span>模拟次数</span>
+                          <input v-model="paper.simulationPaths" type="text" placeholder="200">
+                        </label>
+                        <label v-if="isPaperFutureModule" class="field">
+                          <span>随机种子</span>
+                          <input v-model="paper.simulationSeed" type="text" placeholder="可空">
+                        </label>
+	                      <label v-if="isPaperAccountModule || paper.executePaperAccount" class="field">
+	                        <span>手续费率</span>
+	                        <input v-model="paper.commissionRate" type="text" placeholder="0 或 0.1%">
+                        </label>
+                        <label v-if="isPaperAccountModule || paper.executePaperAccount" class="field">
+	                        <span>滑点率</span>
+	                        <input v-model="paper.slippageRate" type="text" placeholder="0 或 0.05%">
+	                      </label>
+	                    </div>
+	                    <label class="field full">
+	                      <span>核心论点</span>
+	                      <textarea v-model="paper.conclusionThesis" rows="3" placeholder="记录这次结论为什么值得跟踪"></textarea>
+	                    </label>
+                      <label class="field full">
+                        <span>{{ isPaperAccountModule ? "可选：从任务结论回填" : "可选：从任务结论回填" }}</span>
+                        <select v-model="paper.selectedSignalRunId" @change="applyPaperSignal({ mode: 'live', submit: false })">
+                          <option value="">不使用任务，直接用上方手动参数</option>
+                          <option v-for="signal in currentPaperSignals" :key="signal.run_id" :value="signal.run_id">
+                            {{ signal.ticker }} · {{ signal.analysis_date || signal.run_id }} · {{ signal.execution_plan?.action }} {{ formatPercent(signal.execution_plan?.target_position_size) }}
+                          </option>
+                        </select>
+                      </label>
+                      <label v-if="isPaperFutureModule" class="paper-autorefresh">
+                        <input v-model="paper.executePaperAccount" type="checkbox">
+                        <span>同时加入纸面账户</span>
+                      </label>
+	                    <button type="button" class="primary-button" :disabled="paper.loading" @click="paper.selectedSignalRunId ? applyPaperSignal({ mode: 'live', submit: true }) : (isPaperAccountModule ? submitPaperOrder() : submitForecastObservation())">{{ paper.selectedSignalRunId ? paperSignalSubmitLabel('live') : (isPaperAccountModule ? "用手动参数写入纸面账户" : "用手动参数运行推演") }}</button>
+                    </section>
+
+                    <section v-if="isPaperReplayModule" class="paper-flow-section">
+                      <div class="section-title-row">
+                        <div>
+                          <h3>历史真实数据回测</h3>
+                          <p>使用结论日期之后的真实历史价格回放，不影响推演模拟盘和纸面账户。</p>
+                        </div>
+                      </div>
+                      <label class="field full">
+                        <span>使用历史任务结论</span>
+                        <select v-model="paper.selectedReplaySignalRunId" @change="applyPaperSignal({ mode: 'replay', submit: false })">
+                          <option value="">选择过去 execution_plan</option>
+                          <option v-for="signal in historicalPaperSignals" :key="signal.run_id" :value="signal.run_id">
+                            {{ signal.ticker }} · {{ signal.analysis_date || signal.run_id }} · {{ signal.execution_plan?.action }} {{ formatPercent(signal.execution_plan?.target_position_size) }}
+                          </option>
+                        </select>
+                      </label>
+                      <div class="paper-order-grid">
+                        <label class="field">
+                          <span>回测标的</span>
+                          <input v-model="paper.replayTicker" type="text" :placeholder="paper.ticker">
+                        </label>
+                        <label class="field">
+                          <span>结论日期</span>
+                          <input v-model="paper.replayTradeDate" type="date">
+                        </label>
+                        <label class="field">
+                          <span>动作</span>
+                          <select v-model="paper.replayAction">
+                            <option value="buy">buy</option>
+                            <option value="overweight">overweight</option>
+                            <option value="hold">hold</option>
+                            <option value="underweight">underweight</option>
+                            <option value="sell">sell</option>
+                          </select>
+                        </label>
+                        <label class="field">
+                          <span>目标仓位</span>
+                          <input v-model="paper.replayTargetPositionSize" type="text" placeholder="0.10">
+                        </label>
+                        <label class="field">
+                          <span>回测周期(天)</span>
+                          <input v-model="paper.replayHorizonDays" type="text" placeholder="20">
+                        </label>
+                      </div>
+                      <label class="field full">
+                        <span>历史论点</span>
+                        <textarea v-model="paper.replayThesis" rows="3" placeholder="历史结论会回填到这里"></textarea>
+                      </label>
+	                    <button type="button" class="ghost-button" :disabled="paper.loading || !paper.replayTicker || !paper.replayTradeDate" @click="paper.selectedReplaySignalRunId ? applyPaperSignal({ mode: 'replay', submit: true }) : replayManualHistoricalPaper()">{{ paper.selectedReplaySignalRunId ? paperSignalSubmitLabel('replay') : "运行手动回测" }}</button>
+                      <div v-if="paper.replayAccount" class="paper-account-summary">
+                        <article>
+                          <span>起始资金</span>
+                          <strong>{{ formatNumber(paper.replayAccount?.initial_cash) }}</strong>
+                        </article>
+                        <article>
+                          <span>最终权益</span>
+                          <strong>{{ formatNumber((paper.replayResult?.final_snapshot || {}).equity || paper.replayAccount?.equity) }}</strong>
+                        </article>
+                        <article>
+                          <span>最终收益</span>
+                          <strong>{{ formatPercent(paper.replayResult?.final_return) }}</strong>
+                        </article>
+                        <article>
+                          <span>更新时间</span>
+                          <strong>{{ paper.replayLastUpdated || "N/A" }}</strong>
+                        </article>
+                      </div>
+                      <div v-if="selectedReplaySnapshots.length" class="paper-snapshot-list">
+                        <div class="metric-row paper-snapshot-row metric-head">
+                          <span>Time</span>
+                          <span>Equity</span>
+                          <span>Return</span>
+                          <span>Cash</span>
+                        </div>
+                        <div v-for="snapshot in selectedReplaySnapshots.slice(-8)" :key="'replay-' + snapshot.trade_date" class="metric-row paper-snapshot-row">
+                          <span>{{ formatLocalDateTime(snapshot.trade_date) }}</span>
+                          <span>{{ formatNumber(snapshot.equity) }}</span>
+                          <span>{{ formatPercent(snapshot.total_return) }}</span>
+                          <span>{{ formatNumber(snapshot.cash) }}</span>
+                        </div>
+                      </div>
+                    </section>
+	                  </div>
+	                  <div v-else-if="selectedPaperTradingView === 'account'" class="detail-stack">
+	                    <div class="paper-account-summary">
+                      <article>
+                        <span>初始资金</span>
+                        <strong>{{ formatNumber(paper.account?.initial_cash) }}</strong>
+                      </article>
+                      <article>
+                        <span>当前权益</span>
+                        <strong>{{ formatNumber(paper.account?.equity) }}</strong>
+                      </article>
+                      <article>
+                        <span>累计收益</span>
+                        <strong>{{ formatPercent(paper.account?.total_return) }}</strong>
+                      </article>
+                      <article>
+	                        <span>记录数</span>
+	                        <strong>{{ selectedPaperSnapshots.length }}</strong>
+	                      </article>
+	                    </div>
+	                    <div class="paper-track-list">
+	                      <div class="alpha-section-head">
+	                        <strong>结论跟踪</strong>
+	                        <small>{{ paperConclusionTracks.length }} 条</small>
+	                      </div>
+	                      <p v-if="!paperConclusionTracks.length">还没有进入模拟组合的研究结论。</p>
+	                      <article v-for="track in paperConclusionTracks" :key="track.trade_date + track.ticker + track.source_run_id" class="paper-track-card">
+	                        <div class="history-head">
+	                          <strong>{{ track.ticker }}</strong>
+	                          <div class="history-head-meta">
+	                            <span>{{ simulationStateLabel(track.status) }}</span>
+	                            <span>{{ track.rating || track.action || "Manual" }}</span>
+	                          </div>
+	                        </div>
+	                        <p>{{ track.thesis || "手动加入的模拟跟踪结论" }}</p>
+	                        <div class="paper-track-progress">
+	                          <span :style="{ width: formatPercent(track.progress) }"></span>
+	                        </div>
+	                        <small>
+	                          {{ track.age_days }}/{{ track.horizon_days }} 天 · 当前收益 {{ formatPercent(track.current_return) }} · 目标仓位 {{ formatPercent(track.target_position_size) }}
+	                        </small>
+	                      </article>
+	                    </div>
+	                    <div class="paper-account-table">
+                      <div class="metric-row paper-account-row metric-head">
+                        <span>Time</span>
+                        <span>Equity</span>
+                        <span>Return</span>
+                        <span>Cash</span>
+                        <span>Position</span>
+                      </div>
+                      <p v-if="!selectedPaperSnapshots.length">当前账户还没有快照记录。</p>
+                      <div
+                        v-for="snapshot in selectedPaperSnapshots.slice().reverse().slice(0, 30)"
+                        :key="snapshot.trade_date"
+                        class="metric-row paper-account-row"
+                      >
+                        <span>{{ formatLocalDateTime(snapshot.trade_date) }}</span>
+                        <span>{{ formatNumber(snapshot.equity) }}</span>
+                        <span>{{ formatPercent(snapshot.total_return) }}</span>
+                        <span>{{ formatNumber(snapshot.cash) }}</span>
+                        <span>{{ formatNumber(snapshot.positions_value) }}</span>
+                      </div>
+		                    </div>
+		                  </div>
+                  <div v-else-if="selectedPaperTradingView === 'analytics'" class="detail-stack">
+                    <div class="paper-skill-panel">
+                      <div class="alpha-section-head">
+                        <strong>计算 Skills</strong>
+                        <button type="button" class="ghost-button mini" @click="refreshPaperAnalytics">重新计算</button>
+                      </div>
+                      <label v-for="skill in paper.analyticsSkills" :key="skill.name" :class="{ disabled: skill.available === false }">
+                        <input
+                          v-model="paper.selectedAnalyticsSkills[skill.name]"
+                          type="checkbox"
+                          :disabled="skill.available === false"
+                          @change="refreshPaperAnalytics"
+                        >
+                        <span>
+                          <b>{{ skill.label || skill.name }}</b>
+                          <small>{{ skill.available === false ? "未安装" : (skill.description || skill.name) }}</small>
+                        </span>
+                      </label>
                     </div>
-                    <pre v-else>{{ JSON.stringify(selectedBacktestDetail, null, 2) }}</pre>
+                    <div class="paper-account-summary">
+                      <article>
+                        <span>总收益</span>
+                        <strong>{{ formatPercent(paper.analytics?.summary?.total_return) }}</strong>
+                      </article>
+                      <article>
+                        <span>最大回撤</span>
+                        <strong>{{ formatPercent(paper.analytics?.summary?.max_drawdown) }}</strong>
+                      </article>
+                      <article>
+                        <span>Sharpe</span>
+                        <strong>{{ formatNumber(paper.analytics?.summary?.annualized_sharpe, 2) }}</strong>
+                      </article>
+                      <article>
+                        <span>胜率</span>
+                        <strong>{{ formatPercent(paper.analytics?.summary?.win_rate) }}</strong>
+                      </article>
+                      <article>
+                        <span>跟踪中</span>
+                        <strong>{{ paper.analytics?.summary?.track_counts?.tracking || 0 }}</strong>
+                      </article>
+                      <article>
+                        <span>待复盘</span>
+                        <strong>{{ paper.analytics?.summary?.track_counts?.due_review || 0 }}</strong>
+                      </article>
+                    </div>
+                    <div class="kv-grid">
+                      <span>样本数</span><b>{{ paper.analytics?.summary?.observations || 0 }}</b>
+                      <span>区间波动</span><b>{{ formatPercent(paper.analytics?.summary?.period_volatility) }}</b>
+                      <span>最好区间</span><b>{{ formatPercent(paper.analytics?.summary?.best_period_return) }}</b>
+                      <span>最差区间</span><b>{{ formatPercent(paper.analytics?.summary?.worst_period_return) }}</b>
+                      <span>计算 Skills</span><b>{{ (paper.analytics?.skills || []).join(" + ") || "builtin_performance" }}</b>
+                      <span>QuantStats</span><b>{{ paper.analytics?.quantstats_available ? "已启用" : "未安装" }}</b>
+                    </div>
+                    <p v-if="paper.analytics?.message">{{ paper.analytics.message }}</p>
                   </div>
-                </article>
-                <article class="feature-card feature-wide">
-                  <span>完成后更新因子库</span>
-                  <strong>{{ (selectedTaskView.attachments || {}).alpha_mining_enabled ? "已启用" : "未启用" }}</strong>
-                  <p>{{ (selectedTaskView.attachments || {}).alpha_mining_summary || "无" }}</p>
-                  <div v-if="(selectedTaskView.attachments || {}).alpha_mining_detail" class="feature-detail">
-                    <label class="field full">
-                      <span>Alpha 因子结果</span>
-                      <select v-model="selectedAlphaView">
-                        <option value="selected">Selected Alpha</option>
-                        <option value="metrics">Signal Metrics</option>
-                        <option value="summary">Alpha Summary</option>
-                        <option value="raw">Raw JSON</option>
-                      </select>
-                    </label>
-                    <div v-if="selectedAlphaView === 'selected'" class="alpha-panel">
-                      <div v-if="Object.keys(selectedAlphaDetail.selected_alpha || {}).length" class="kv-grid">
-                        <template v-for="(value, key) in selectedAlphaDetail.selected_alpha" :key="key">
-                          <span>{{ key }}</span>
-                          <b>{{ formatAlphaValue(value) }}</b>
-                        </template>
-                      </div>
-                      <p v-else>本次任务没有返回 selected_alpha 详情。</p>
+                  <div v-else-if="selectedPaperTradingView === 'ledger'" class="detail-stack">
+                    <div class="alpha-section-head">
+                      <strong>{{ paperLedgerTitle }}</strong>
+                      <button type="button" class="ghost-button mini" @click="refreshPaperEpisodes">刷新</button>
                     </div>
-                    <div v-else-if="selectedAlphaView === 'metrics'" class="metric-strip">
-                      <div>
-                        <span>Signal Score</span>
-                        <strong>{{ formatNumber(selectedAlphaDetail.signal_score, 4) }}</strong>
+                    <div class="paper-account-summary">
+                      <article>
+                        <span>总记录</span>
+                        <strong>{{ paperEpisodeSummary.total_episodes || 0 }}</strong>
+                      </article>
+                      <article>
+                        <span>已观察</span>
+                        <strong>{{ paperEpisodeSummary.observed_count || 0 }}</strong>
+                      </article>
+                      <article>
+                        <span>平均收益</span>
+                        <strong>{{ formatPercent(paperEpisodeSummary.average_return) }}</strong>
+                      </article>
+                      <article>
+                        <span>胜率</span>
+                        <strong>{{ formatPercent(paperEpisodeSummary.win_rate) }}</strong>
+                      </article>
+                    </div>
+                    <div class="kv-grid">
+                      <span>复合收益</span><b>{{ formatPercent(paperEpisodeSummary.total_return) }}</b>
+                      <span>平均置信度</span><b>{{ formatPercent(paperEpisodeSummary.average_confidence) }}</b>
+                      <span>平均目标仓位</span><b>{{ formatPercent(paperEpisodeSummary.average_target_position_size) }}</b>
+                      <span>更新时间</span><b>{{ paper.ledgerLastUpdated || paper.episodes?.updated_at || "N/A" }}</b>
+                    </div>
+                    <div class="paper-ledger-table">
+                      <div class="metric-row paper-ledger-row metric-head">
+                        <span>分组</span>
+                        <span>名称</span>
+                        <span>记录</span>
+                        <span>平均收益</span>
+                        <span>胜率</span>
                       </div>
-                      <div>
-                        <span>Confidence</span>
-                        <strong>{{ formatPercent(selectedAlphaDetail.confidence) }}</strong>
-                      </div>
-                      <div>
-                        <span>Registry</span>
-                        <strong>{{ selectedAlphaDetail.registry_file || "N/A" }}</strong>
+                      <p v-if="!paperLedgerFacetRows.length">还没有可统计的演练记录。</p>
+                      <div
+                        v-for="row in paperLedgerFacetRows.slice(0, 24)"
+                        :key="row.facet + row.name"
+                        class="metric-row paper-ledger-row"
+                      >
+                        <span>{{ row.facet }}</span>
+                        <span>{{ row.name }}</span>
+                        <span>{{ row.count }} / {{ row.observed_count }}</span>
+                        <span>{{ formatPercent(row.average_return) }}</span>
+                        <span>{{ formatPercent(row.win_rate) }}</span>
                       </div>
                     </div>
-                    <div v-else-if="selectedAlphaView === 'summary'" class="alpha-summary">
-                      <pre>{{ formatAlphaValue(selectedAlphaDetail.summary) }}</pre>
+                    <div class="paper-track-list">
+                      <div class="alpha-section-head">
+                        <strong>最近记录</strong>
+                        <small>{{ scopedPaperEpisodes.length }} 条</small>
+                      </div>
+                      <p v-if="!scopedPaperEpisodes.length">当前模块还没有账本记录。</p>
+                      <article v-for="episode in scopedPaperEpisodes.slice(0, 12)" :key="episode.episode_id" class="paper-track-card paper-ledger-card">
+                        <div class="history-head">
+                          <strong>{{ episode.ticker }}</strong>
+                          <div class="history-head-meta">
+	                            <span>{{ simulationTypeLabel(episode.simulation_type || episode.mode) }}</span>
+	                            <span>{{ simulationStateLabel(episode.status) }}</span>
+                          </div>
+                        </div>
+                        <p>{{ episode.thesis || episode.reason || "无结论摘要" }}</p>
+                        <small>
+                          {{ episode.signal_date || "N/A" }} · {{ episode.rating || episode.action || "N/A" }}
+                          · 仓位 {{ formatPercent(episode.target_position_size) }}
+                          · 收益 {{ formatPercent(episode.final_return) }}
+                        </small>
+                      </article>
                     </div>
-                    <pre v-else>{{ JSON.stringify(selectedAlphaDetail, null, 2) }}</pre>
                   </div>
-                </article>
-              </div>
+	                  <div v-else-if="selectedPaperTradingView === 'fills'" class="detail-stack">
+                    <p v-if="!paperFills.length">当前账户还没有成交。</p>
+	                    <div v-for="fill in paperFills.slice(0, 20)" :key="fill.trade_date + fill.side + fill.price" class="kv-grid">
+	                      <span>Side</span><b>{{ fill.side }}</b>
+	                      <span>Ticker</span><b>{{ fill.ticker }}</b>
+	                      <span>Rating</span><b>{{ fill.rating || fill.action || "Manual" }}</b>
+	                      <span>Horizon</span><b>{{ fill.horizon_days || 20 }} 天</b>
+	                      <span>Quantity</span><b>{{ formatNumber(fill.quantity, 6) }}</b>
+	                      <span>Price</span><b>{{ formatNumber(fill.price, 4) }}</b>
+	                      <span>Gross</span><b>{{ formatNumber(fill.gross_amount) }}</b>
+	                      <span>Commission</span><b>{{ formatNumber(fill.commission) }}</b>
+	                      <span>Source</span><b>{{ fill.source_run_id || "manual" }}</b>
+	                    </div>
+                  </div>
+                  <div v-else-if="selectedPaperTradingView === 'positions'" class="detail-stack">
+                    <p v-if="!paperPositions.length">当前账户无持仓。</p>
+                    <div v-for="position in paperPositions" :key="position.ticker" class="kv-grid">
+                      <span>Ticker</span><b>{{ position.ticker }}</b>
+                      <span>Quantity</span><b>{{ formatNumber(position.quantity, 6) }}</b>
+                      <span>Avg Cost</span><b>{{ formatNumber(position.average_cost, 4) }}</b>
+                      <span>Last Price</span><b>{{ formatNumber(position.last_price, 4) }}</b>
+                      <span>Market Value</span><b>{{ formatNumber(position.market_value) }}</b>
+                      <span>Unrealized PnL</span><b>{{ formatNumber(position.unrealized_pnl) }}</b>
+                    </div>
+                  </div>
+                  <div v-else-if="selectedPaperTradingView === 'api'" class="kv-grid">
+                    <span>Quote API</span><b>GET /api/simulation/forecast/quote?ticker={{ paper.ticker }}</b>
+                    <span>Account API</span><b>GET /api/simulation/forecast/account</b>
+	                    <span>Order API</span><b>POST /api/simulation/forecast/order</b>
+	                    <span>Simulation Run</span><b>POST /api/forecast-observations</b>
+	                    <span>Signals API</span><b>GET /api/simulation/forecast/signals</b>
+	                    <span>Skills API</span><b>GET /api/simulation/forecast/skills</b>
+	                    <span>Analytics API</span><b>GET /api/simulation/forecast/analytics</b>
+	                    <span>Backtest API</span><b>POST /api/simulation/backtest/manual</b>
+	                    <span>Signal Backtest</span><b>POST /api/simulation/backtest/from-signal</b>
+	                    <span>Observation API</span><b>GET /api/observations</b>
+	                    <span>Observation Intraday</span><b>GET /api/simulation/observation/intraday</b>
+	                    <span>Initial Cash</span><b>{{ formatNumber(paper.account?.initial_cash) }}</b>
+	                    <span>Storage</span><b>workbench_users/&lt;user&gt;/paper_account.json</b>
+	                  </div>
+	                </article>
+              </aside>
             </div>
 
             <div v-else class="config-preview">

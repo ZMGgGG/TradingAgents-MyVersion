@@ -67,7 +67,7 @@ def coerce_time_context(
     """Normalize an arbitrary object into a TimeContext."""
     if isinstance(value, TimeContext):
         return value
-    if isinstance(value, Mapping):
+    if isinstance(value, Mapping) and value:
         return TimeContext.model_validate(value)
     return TimeContext.from_trade_date(
         trade_date=str(trade_date),

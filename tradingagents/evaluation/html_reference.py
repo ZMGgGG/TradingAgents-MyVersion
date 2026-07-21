@@ -68,7 +68,7 @@ def extract_reference_text_from_pdf_file(path: Path) -> str:
 def _extract_first(text: str, pattern: str) -> str | None:
     match = re.search(pattern, text, flags=re.DOTALL | re.IGNORECASE)
     if match:
-        return match.group(1).strip()
+        return match.group(1 if match.groups() else 0).strip()
     return None
 
 

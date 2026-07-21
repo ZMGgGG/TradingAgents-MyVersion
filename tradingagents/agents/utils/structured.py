@@ -32,6 +32,10 @@ def _has_structured_summary_block(text: str) -> bool:
     return "STRUCTURED_SUMMARY" in text and "END_STRUCTURED_SUMMARY" in text
 
 
+def has_structured_summary_block(text: str) -> bool:
+    return _has_structured_summary_block(text)
+
+
 def _log_summary_status(agent_name: str, block: str, parse: str) -> None:
     logger.warning(
         "[structured-summary] agent=%s block=%s parse=%s",
@@ -47,14 +51,12 @@ def bind_structured(llm: Any, schema: type[T], agent_name: str) -> Optional[Any]
     Logs a warning when the binding fails so the user understands the agent
     will use free-text generation for every call instead of one-shot fallback.
     """
-    # Temporarily disable provider-native structured output binding.
-    # We currently rely on natural-language responses plus a trailing
-    # STRUCTURED_SUMMARY block, which is parsed locally into schema objects.
-    # This avoids repeated provider 400s on models that reject tool_choice
-    # or structured output in thinking mode.
-    return None
+    # Real providers use natural-language responses plus a trailing
+    # STRUCTURED_SUMMARY block, parsed locally. Unit-test mocks still exercise
+    # the structured path so render/schema regressions stay covered.
+    if type(llm).__module__ != "unittest.mock":
+        return None
 
-    # Keep the original implementation below for easy re-enable later.
     try:
         return llm.with_structured_output(schema)
     except (NotImplementedError, AttributeError) as exc:

@@ -1,6 +1,6 @@
 # TradingAgents MyVersion
 
-这是一个基于 TradingAgents 改造的量化研究与多 Agent 交易分析项目。当前版本重点不再只是命令行研究框架，而是围绕 Web Workbench、因子库、Alpha Mining、报告评估、回测和执行过程可观测性，做成一个更适合日常研究和复盘的工作台。
+这是一个基于 TradingAgents 改造的量化研究与多 Agent 交易分析项目。当前版本重点不再只是命令行研究框架，而是围绕 Web Workbench、因子库、Alpha Mining、报告评估、回测、纸面交易、结论跟踪和执行过程可观测性，做成一个更适合日常研究、演练和复盘的工作台。
 
 本项目仅用于研究和策略分析，不构成投资建议。
 
@@ -12,6 +12,9 @@
 - 新增 Alpha Mining：支持候选因子生成、变异、评估、历史沉淀和经验摘要。
 - 新增报告评估：支持参考报告、HTML/PDF 文本抽取和报告质量评估。
 - 新增回测链路：可对交易决策做持有期验证，并在 Workbench 中展示回测结果。
+- 新增 Paper Trading：支持纸面账户、手动下单、历史结论回放、佣金/滑点模拟和账户绩效曲线。
+- 新增结论跟踪：可把分析结论沉淀为观察对象，跟踪状态、复盘窗口、模拟结果和最终验证结论。
+- 新增推演模拟盘：支持对未来观察期做情景模拟，记录 forecast episode，并可选择同步写入纸面账户。
 - 新增运行指标：记录 LLM 调用、Tool 调用、Token、耗时、Agent 阶段和事件，方便定位任务卡住或输出缺失。
 - 增强数据链路：补充加密货币工具、中文零售代理数据、社交数据 fallback、非美资产和中文输出支持。
 - 优化执行策略：Hold 决策不会再产生默认仓位，仓位逻辑集中到执行策略层处理。
@@ -41,7 +44,7 @@
   -> Trader 生成交易计划
   -> Risk Team 做风险辩论
   -> Portfolio Manager 给出最终决策
-  -> 报告、回测、评估、历史沉淀
+  -> 报告、回测、评估、纸面交易、结论跟踪、历史沉淀
 ```
 
 因子库不是替代 LLM 研究过程，而是在研究经理形成结论后，把历史因子、Alpha Mining 经验和当前上下文转成结构化评分，再交给 Trader 作为交易计划前的额外证据。
@@ -60,18 +63,21 @@
 │   ├── index.html              # Workbench 页面入口
 │   ├── app.js                  # Workbench 前端逻辑
 │   ├── styles.css              # Workbench 样式
-│   └── server.py               # Workbench 轻量后端服务
+│   ├── server.py               # Workbench 轻量后端服务
+│   └── workbench_api_paths.py  # Workbench API 兼容路径别名
 ├── tradingagents/
 │   ├── agents/                 # 分析师、研究员、交易员、风险和管理类 Agent
 │   ├── alpha_mining/           # 因子挖掘、候选生成、变异、评估和经验摘要
 │   ├── backtesting/            # 回测引擎
+│   ├── conclusions/            # 研究结论跟踪、生命周期和复盘摘要
 │   ├── content_discovery/      # 参考内容发现
 │   ├── core/                   # 运行指标、时间上下文等核心工具
 │   ├── dataflows/              # 市场、社交、中文代理和加密货币数据链路
 │   ├── decisioning/            # 执行策略、因子评分和风险门控
 │   ├── evaluation/             # 报告评估和参考文本抽取
 │   ├── graph/                  # LangGraph 编排、传播和状态日志
-│   └── llm_clients/            # LLM 客户端适配
+│   ├── llm_clients/            # LLM 客户端适配
+│   └── papertrading/           # 纸面交易账户、成交、episode ledger 和绩效分析
 ├── tests/                      # Workbench、因子、回测、报告、数据链路和运行指标测试
 ├── docker-compose.yml          # CLI / Workbench / Ollama 容器编排
 ├── Dockerfile
@@ -87,6 +93,12 @@
 python -m venv .venv
 source .venv/bin/activate
 pip install .
+```
+
+如果需要运行测试和开发工具，安装开发依赖：
+
+```bash
+pip install ".[dev]"
 ```
 
 启动 CLI：
@@ -162,8 +174,32 @@ Workbench 的主要模块包括：
 - 报告预览：查看结构化报告章节。
 - 日志：查看运行过程、LLM/Tool 调用和异常信息。
 - 历史任务：查看、同步、复用和重新运行历史分析。
+- 纸面交易：查看纸面账户、提交手动订单、从历史任务结论回填交易参数，并追踪成交和持仓。
+- 历史回放：使用历史真实价格对已有结论或手动交易计划做持有期回放。
+- 推演模拟盘：对未来观察期做情景模拟，支持基于历史波动估计、手动 drift/volatility、模拟路径数量和随机种子。
+- 结论跟踪：把最终决策、手动观察或推演结果沉淀为可复盘条目，按跟踪中、待复盘、已验证、已失效等状态管理。
 
 Factor Manager 的输出会在实时执行过程中写入任务快照；如果是旧历史任务，后端会尝试从落盘状态日志回填。
+
+## 纸面交易与结论跟踪
+
+Paper Trading 不是实盘交易接口，只用于研究演练和复盘。它会在 Workbench 用户目录下维护本地纸面账户、成交、账户快照和 episode ledger。
+
+主要能力：
+
+- 纸面账户：支持初始资金、目标仓位、买入/卖出/减仓、佣金和滑点设置。
+- 历史回放：从历史任务最终决策或手动参数生成纸面订单，用真实历史价格验证持有期表现。
+- 推演模拟：当未来真实价格不足时，可按情景参数生成预测路径，并保留真实价格可用后的对照序列。
+- 结论生命周期：将研究结论记录为 track，支持 due review、validated、invalidated、exited 等状态和复盘事件。
+- Analytics：内置账户收益、回撤、胜率、Sharpe、结论生命周期统计等指标；若本地安装了扩展分析库，也可以继续增强。
+
+相关数据按用户隔离，默认落在 `.tradingagents/workbench_users/<user_id>/` 下，常见文件包括：
+
+- `paper_account.json`
+- `paper_episodes.json`
+- `conclusion_tracks.json`
+
+Workbench 同时保留一组语义化 API 路径别名，例如 `/api/simulation/forecast/order` 会映射到 `/api/paper/order`，方便前端逐步从旧命名迁移到更清晰的模拟/观察语义。
 
 ## 测试与验证
 
@@ -171,14 +207,14 @@ Factor Manager 的输出会在实时执行过程中写入任务快照；如果�
 
 ```bash
 node --check frontend/app.js
-python -m py_compile frontend/server.py
-python -m pytest tests/test_workbench_server_hardening.py tests/test_execution_policy.py tests/test_run_metrics.py -q
+python -m py_compile frontend/server.py frontend/workbench_api_paths.py
+python -m pytest tests/test_workbench_server_hardening.py tests/test_execution_policy.py tests/test_run_metrics.py tests/test_model_validation.py tests/test_memory_log.py tests/test_structured_agents.py tests/test_time_context_phase1.py -q
 ```
 
 更完整的相关回归：
 
 ```bash
-python -m pytest tests/test_alpha_mining.py tests/test_content_discovery.py tests/test_report_evaluation.py -q
+python -m pytest tests/test_alpha_mining.py tests/test_content_discovery.py tests/test_report_evaluation.py tests/test_papertrading.py tests/test_paper_episode_ledger.py tests/test_paper_analytics.py tests/test_paper_market_history.py tests/test_conclusions.py -q
 ```
 
 ## Git 维护

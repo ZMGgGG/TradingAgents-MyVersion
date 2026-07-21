@@ -302,6 +302,7 @@ def _should_fallback_on_result(vendor: str, result: object) -> bool:
     normalized = result.strip().lower()
     soft_markers = (
         "no data found",
+        "no akshare cn stock data found",
         "data unavailable",
         "rate limited",
         "unavailable",

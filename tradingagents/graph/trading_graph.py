@@ -18,6 +18,7 @@ from langgraph.prebuilt import ToolNode
 from tradingagents.llm_clients import create_llm_client
 from tradingagents.backtesting.engine import BacktestResult, BacktestScenario, BatchBacktester
 from tradingagents.core.data_snapshot import DataSnapshot
+from tradingagents.papertrading import PaperTradingResult, PaperTradingRunner
 
 from tradingagents.agents import *
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -287,12 +288,12 @@ class TradingAgentsGraph:
             end = start + timedelta(days=holding_days + 7)  # buffer for weekends/holidays
             end_str = end.strftime("%Y-%m-%d")
 
-            stock = self._load_price_history_for_returns(ticker, trade_date, end_str)
+            stock = TradingAgentsGraph._load_price_history_for_returns(self, ticker, trade_date, end_str)
 
             if len(stock) < 2:
                 return None, None, None
 
-            bench = self._load_price_history_for_returns(benchmark, trade_date, end_str)
+            bench = TradingAgentsGraph._load_price_history_for_returns(self, benchmark, trade_date, end_str)
 
             if len(bench) < 2:
                 actual_days = min(holding_days, len(stock) - 1)
@@ -328,10 +329,17 @@ class TradingAgentsGraph:
 
     def _load_price_history_for_returns(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
         """Load post-analysis price history via the same vendor-compat path used elsewhere."""
-        payload = route_to_vendor("get_stock_data", symbol, start_date, end_date)
-        df = self._parse_price_payload_to_dataframe(payload)
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            return df
+        try:
+            payload = route_to_vendor("get_stock_data", symbol, start_date, end_date)
+            df = self._parse_price_payload_to_dataframe(payload)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        except Exception as exc:
+            logger.debug(
+                "Vendor price history unavailable for %s; falling back to yfinance: %s",
+                symbol,
+                exc,
+            )
         return yf.Ticker(symbol).history(start=start_date, end=end_date)
 
     def _parse_price_payload_to_dataframe(self, payload: Any) -> pd.DataFrame:
@@ -596,4 +604,30 @@ class TradingAgentsGraph:
             final_states,
             holding_days=holding_days,
             initial_capital=initial_capital,
+        )
+
+    def run_paper_trade_from_final_state(
+        self,
+        ticker: str,
+        trade_date: str,
+        final_state: dict[str, Any],
+        holding_days: int = 5,
+        initial_capital: float = 100000.0,
+        commission_rate: float = 0.0,
+        slippage_rate: float = 0.0,
+        asset_type: str = "stock",
+        simulation_options: dict[str, Any] | None = None,
+    ) -> PaperTradingResult:
+        """Apply an existing final state to a local simulated paper account."""
+        runner = PaperTradingRunner.from_graph(self)
+        return runner.run_from_final_state(
+            ticker,
+            trade_date,
+            final_state,
+            holding_days=holding_days,
+            initial_capital=initial_capital,
+            commission_rate=commission_rate,
+            slippage_rate=slippage_rate,
+            asset_type=asset_type,
+            simulation_options=simulation_options,
         )

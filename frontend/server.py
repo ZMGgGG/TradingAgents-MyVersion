@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import copy
+import csv
 import hashlib
 import hmac
 import json
@@ -14,10 +15,12 @@ import time
 import uuid
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from io import StringIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from tradingagents.alpha_mining import (
     AlphaCandidate,
@@ -41,6 +44,19 @@ from tradingagents.evaluation import (
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.backtesting.engine import BacktestResult
+from tradingagents.conclusions import ConclusionStore, summarize_conclusions
+from tradingagents.papertrading import (
+    PaperEpisode,
+    PaperEpisodeLedger,
+    PaperBroker,
+    PaperOrder,
+    PaperPosition,
+    PaperTradingResult,
+    make_episode_id,
+    quote_staleness_days,
+    list_paper_analytics_skills,
+    run_paper_analytics,
+)
 from tradingagents.agents.schemas import parse_pm_decision
 from tradingagents.core.run_metrics import (
     RunMetricsCallbackHandler,
@@ -48,6 +64,8 @@ from tradingagents.core.run_metrics import (
 )
 from tradingagents.llm_clients.model_catalog import MODEL_OPTIONS
 from tradingagents.graph.checkpointer import clear_checkpoint, has_checkpoint
+from tradingagents.dataflows.interface import route_to_vendor
+from frontend.workbench_api_paths import canonical_api_path
 
 
 ROOT = Path(__file__).resolve().parent
@@ -58,6 +76,30 @@ RUN_USER_CONCURRENCY = max(1, int(os.environ.get("TRADINGAGENTS_WORKBENCH_USER_C
 RUN_SLOT = threading.Semaphore(RUN_CONCURRENCY)
 USER_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 PERSISTED_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "stale"}
+WORKBENCH_TIMEZONE = os.environ.get("TRADINGAGENTS_TIMEZONE") or os.environ.get("TZ") or "Asia/Shanghai"
+
+
+def _workbench_tz() -> datetime.tzinfo:
+    try:
+        return ZoneInfo(WORKBENCH_TIMEZONE)
+    except ZoneInfoNotFoundError:
+        return datetime.datetime.now().astimezone().tzinfo or datetime.timezone.utc
+
+
+def _now_local() -> datetime.datetime:
+    return datetime.datetime.now(_workbench_tz())
+
+
+def _now_iso() -> str:
+    return _now_local().isoformat(timespec="seconds")
+
+
+def _today_iso() -> str:
+    return _now_local().date().isoformat()
+
+
+def _canonical_api_path(path: str) -> str:
+    return canonical_api_path(path)
 
 STRUCTURED_SUMMARY_LABELS = {
     "STRUCTURED_SUMMARY": "结构化摘要",
@@ -215,7 +257,7 @@ def _public_auth_payload(username: str, user_id: str, role: str = "user") -> dic
 
 def _append_auth_audit(event: str, actor: str = "", target: str = "", details: dict[str, Any] | None = None) -> None:
     row = {
-        "ts": datetime.datetime.now().isoformat(),
+        "ts": _now_iso(),
         "event": event,
         "actor": actor,
         "target": target,
@@ -376,7 +418,7 @@ def _register_auth_user(username: str, password: str) -> dict[str, Any]:
             "role": role,
             "disabled": False,
             "password_hash": _hash_password(password),
-            "created_at": datetime.datetime.now().isoformat(),
+            "created_at": _now_iso(),
             "last_login_at": "",
             "failed_login_count": 0,
             "locked_until": 0,
@@ -417,7 +459,7 @@ def _authenticate_user(username: str, password: str) -> tuple[dict[str, Any] | N
             if failed_count >= AUTH_FAILED_LOGIN_LIMIT:
                 return None, "登录失败次数过多，账号已临时锁定 5 分钟。"
             return None, "用户名或密码不正确。"
-        user["last_login_at"] = datetime.datetime.now().isoformat()
+        user["last_login_at"] = _now_iso()
         user["failed_login_count"] = 0
         user["locked_until"] = 0
         user.setdefault("role", "user")
@@ -436,7 +478,7 @@ def _create_auth_session(user: dict[str, Any]) -> str:
             "username": user["username"],
             "user_id": user["user_id"],
             "role": user.get("role") or "user",
-            "created_at": datetime.datetime.now().isoformat(),
+            "created_at": _now_iso(),
             "expires_at": now + AUTH_SESSION_TTL_SECONDS,
         }
         _save_auth_sessions_locked(data)
@@ -558,7 +600,7 @@ def _admin_update_user(actor: str, target_username: str, updates: dict[str, Any]
         if updates.get("unlock"):
             user["failed_login_count"] = 0
             user["locked_until"] = 0
-        user["updated_at"] = datetime.datetime.now().isoformat()
+        user["updated_at"] = _now_iso()
         _save_auth_users_locked(data)
         _append_auth_audit(
             "admin_update_user",
@@ -580,7 +622,7 @@ def _admin_reset_password(actor: str, target_username: str, new_password: str) -
         user["password_hash"] = _hash_password(new_password)
         user["failed_login_count"] = 0
         user["locked_until"] = 0
-        user["updated_at"] = datetime.datetime.now().isoformat()
+        user["updated_at"] = _now_iso()
         _save_auth_users_locked(data)
 
         sessions = _load_auth_sessions_locked()
@@ -664,6 +706,26 @@ def _workbench_settings_file(user_id: str) -> Path:
     return _workbench_user_root(user_id) / "workbench_settings.json"
 
 
+def _paper_account_file(user_id: str) -> Path:
+    return _workbench_user_root(user_id) / "paper_account.json"
+
+
+def _paper_episode_file(user_id: str) -> Path:
+    return _workbench_user_root(user_id) / "paper_episodes.json"
+
+
+def _paper_episode_ledger(user_id: str) -> PaperEpisodeLedger:
+    return PaperEpisodeLedger(_paper_episode_file(user_id))
+
+
+def _conclusions_file(user_id: str) -> Path:
+    return _workbench_user_root(user_id) / "conclusion_tracks.json"
+
+
+def _conclusion_store(user_id: str) -> ConclusionStore:
+    return ConclusionStore(_conclusions_file(user_id))
+
+
 def _load_workbench_settings(user_id: str) -> dict[str, Any]:
     path = _workbench_settings_file(user_id)
     if not path.exists():
@@ -680,7 +742,7 @@ def _save_workbench_settings(user_id: str, updates: dict[str, Any]) -> dict[str,
     path.parent.mkdir(parents=True, exist_ok=True)
     current = _load_workbench_settings(user_id)
     current.update(updates)
-    current["updated_at"] = datetime.datetime.now().isoformat()
+    current["updated_at"] = _now_iso()
     tmp_file = path.with_suffix(".json.tmp")
     tmp_file.write_text(json.dumps(_json_safe(current), ensure_ascii=False, indent=2), encoding="utf-8")
     tmp_file.replace(path)
@@ -746,7 +808,7 @@ def _persist_run_snapshot(run: dict[str, Any]) -> None:
         return
     try:
         payload = _public_run_payload(run)
-        payload["persisted_at"] = datetime.datetime.now().isoformat()
+        payload["persisted_at"] = _now_iso()
         history_dir = _workbench_history_dir(user_id)
         history_dir.mkdir(parents=True, exist_ok=True)
         tmp_file = _run_snapshot_file(user_id, run_id).with_suffix(".json.tmp")
@@ -990,6 +1052,16 @@ def _parse_initial_capital_input(raw: str) -> float:
     return max(0.01, float(normalized))
 
 
+def _parse_rate_input(raw: str) -> float:
+    normalized = str(raw).replace("%", "").strip()
+    if not normalized:
+        return 0.0
+    value = float(normalized)
+    if "%" in str(raw):
+        value = value / 100.0
+    return max(0.0, value)
+
+
 def _save_backtest_result_to_disk(
     result: BacktestResult,
     ticker: str,
@@ -1127,6 +1199,1353 @@ def _backtest_result_payload(
     }
 
 
+def _paper_trading_result_payload(holding_days: int, result: PaperTradingResult) -> dict[str, Any]:
+    payload = result.model_dump() if hasattr(result, "model_dump") else {}
+    snapshots = payload.get("snapshots") or []
+    final_snapshot = snapshots[-1] if snapshots else None
+    payload.update(
+        {
+            "holding_days": holding_days,
+            "actual_holding_days": result.holding_days,
+            "final_snapshot": final_snapshot,
+            "final_equity": (final_snapshot or {}).get("equity"),
+            "final_return": (final_snapshot or {}).get("total_return"),
+            "simulation": payload.get("simulation") or {},
+        }
+    )
+    return payload
+
+
+def _paper_replay_account_payload(result: PaperTradingResult, initial_cash: float) -> dict[str, Any]:
+    snapshots = [snapshot.model_dump() for snapshot in result.snapshots]
+    final_snapshot = snapshots[-1] if snapshots else {}
+    return {
+        "initial_cash": float(initial_cash),
+        "cash": float(final_snapshot.get("cash", initial_cash) or initial_cash),
+        "positions": final_snapshot.get("positions") or {},
+        "fills": [fill.model_dump() for fill in result.fills],
+        "snapshots": snapshots,
+        "market_history": {},
+        "created_at": result.trade_date,
+        "updated_at": _now_iso(),
+    }
+
+
+def _final_state_for_paper_replay(snapshot: dict[str, Any], overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    overrides = overrides or {}
+    final_state = snapshot.get("final_state") if isinstance(snapshot.get("final_state"), dict) else {}
+    if final_state:
+        data = copy.deepcopy(final_state)
+    else:
+        result = snapshot.get("result") if isinstance(snapshot.get("result"), dict) else {}
+        attachments = snapshot.get("attachments") if isinstance(snapshot.get("attachments"), dict) else {}
+        data = {
+            "final_trade_decision": result.get("rating") or "Hold",
+            "execution_plan": attachments.get("execution_plan") or {},
+            "investment_debate_state": {
+                "signal_confidence": result.get("confidence") or 0.0,
+            },
+        }
+    execution_plan = data.setdefault("execution_plan", {})
+    if overrides.get("action"):
+        execution_plan["action"] = str(overrides["action"]).strip().lower()
+    if overrides.get("target_position_size") is not None:
+        execution_plan["target_position_size"] = float(overrides.get("target_position_size") or 0.0)
+    if overrides.get("risk_gate_approved") is not None:
+        execution_plan["risk_gate_approved"] = bool(overrides.get("risk_gate_approved"))
+    return data
+
+
+def _save_paper_trading_result_to_disk(
+    result: PaperTradingResult,
+    ticker: str,
+    trade_date: str,
+    holding_days: int,
+    save_path: Path,
+) -> Path:
+    save_path.mkdir(parents=True, exist_ok=True)
+    file_path = save_path / f"paper_trade_{ticker}_{trade_date}_{holding_days}d.md"
+    lines = [
+        f"# Paper Trading Result: {ticker}",
+        "",
+        f"- Trade Date: {trade_date}",
+        f"- Holding Days: {holding_days}",
+        f"- Resolved: {result.resolved}",
+        "",
+    ]
+    if not result.resolved:
+        lines.extend(["## Outcome", "", result.reason or "No paper trading result could be resolved."])
+    else:
+        final_snapshot = result.snapshots[-1] if result.snapshots else None
+        lines.extend(
+            [
+                "## Order",
+                "",
+                f"- Rating: {result.order.rating if result.order else 'N/A'}",
+                f"- Action: {result.order.action if result.order else 'N/A'}",
+                f"- Target Position Size: {result.order.target_position_size if result.order else 0.0:.2%}",
+                f"- Risk Gate Approved: {result.order.risk_gate_approved if result.order else False}",
+                "",
+                "## Account",
+                "",
+                f"- Final Equity: {final_snapshot.equity:,.2f}" if final_snapshot else "- Final Equity: N/A",
+                f"- Final Return: {final_snapshot.total_return:.2%}" if final_snapshot else "- Final Return: N/A",
+                f"- Cash: {final_snapshot.cash:,.2f}" if final_snapshot else "- Cash: N/A",
+                f"- Positions Value: {final_snapshot.positions_value:,.2f}" if final_snapshot else "- Positions Value: N/A",
+                "",
+                "## Fills",
+                "",
+            ]
+        )
+        if result.fills:
+            for fill in result.fills:
+                lines.append(
+                    f"- {fill.trade_date} {fill.side.upper()} {fill.quantity:.6f} @ {fill.price:.4f}, "
+                    f"gross {fill.gross_amount:,.2f}, commission {fill.commission:,.2f}"
+                )
+        else:
+            lines.append("- No fills.")
+    file_path.write_text("\n".join(lines), encoding="utf-8")
+    return file_path
+
+
+def _default_paper_account(initial_cash: float = 100000.0) -> dict[str, Any]:
+    now = _now_iso()
+    return {
+        "initial_cash": float(initial_cash),
+        "cash": float(initial_cash),
+        "positions": {},
+        "fills": [],
+        "snapshots": [],
+        "market_history": {},
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def _load_paper_account(user_id: str) -> dict[str, Any]:
+    path = _paper_account_file(user_id)
+    if not path.exists():
+        return _default_paper_account()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else _default_paper_account()
+    except Exception:
+        return _default_paper_account()
+
+
+def _save_paper_account(user_id: str, account: dict[str, Any]) -> None:
+    account["updated_at"] = _now_iso()
+    path = _paper_account_file(user_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = path.with_name(f"{path.name}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp")
+    tmp_file.write_text(json.dumps(_json_safe(account), ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_file.replace(path)
+
+
+def _broker_from_account(account: dict[str, Any], commission_rate: float = 0.0, slippage_rate: float = 0.0) -> PaperBroker:
+    broker = PaperBroker(
+        initial_cash=float(account.get("initial_cash") or 100000.0),
+        commission_rate=commission_rate,
+        slippage_rate=slippage_rate,
+    )
+    broker.cash = float(account.get("cash", broker.initial_cash) or 0.0)
+    for ticker, payload in (account.get("positions") or {}).items():
+        if isinstance(payload, dict):
+            broker.positions[str(ticker)] = PaperPosition(
+                ticker=str(payload.get("ticker") or ticker),
+                quantity=float(payload.get("quantity") or 0.0),
+                average_cost=float(payload.get("average_cost") or 0.0),
+                last_price=float(payload.get("last_price") or 0.0),
+            )
+    return broker
+
+
+def _position_payload(position: PaperPosition) -> dict[str, Any]:
+    return {
+        "ticker": position.ticker,
+        "quantity": position.quantity,
+        "average_cost": position.average_cost,
+        "last_price": position.last_price,
+        "market_value": position.market_value,
+        "unrealized_pnl": position.unrealized_pnl,
+    }
+
+
+def _account_payload(account: dict[str, Any]) -> dict[str, Any]:
+    positions = {
+        ticker: _position_payload(
+            PaperPosition(
+                ticker=str(payload.get("ticker") or ticker),
+                quantity=float(payload.get("quantity") or 0.0),
+                average_cost=float(payload.get("average_cost") or 0.0),
+                last_price=float(payload.get("last_price") or 0.0),
+            )
+        )
+        for ticker, payload in (account.get("positions") or {}).items()
+        if isinstance(payload, dict)
+    }
+    positions_value = sum(item["market_value"] for item in positions.values())
+    cash = float(account.get("cash") or 0.0)
+    initial_cash = float(account.get("initial_cash") or 1.0)
+    equity = cash + positions_value
+    return {
+        **account,
+        "positions": positions,
+        "positions_value": positions_value,
+        "equity": equity,
+        "total_return": (equity / initial_cash) - 1.0 if initial_cash else 0.0,
+    }
+
+
+def _paper_analytics_payload(
+    account: dict[str, Any],
+    requested: list[str] | None = None,
+    ticker: str = "",
+) -> dict[str, Any]:
+    return run_paper_analytics(account, requested=requested, context={"ticker": ticker})
+
+
+def _simulation_type_for_episode_mode(mode: str) -> str:
+    normalized = str(mode or "").strip().lower()
+    if normalized in {"backtest", "historical_replay"}:
+        return "backtest"
+    if normalized in {"forward_test", "forecast", "forecast_observation"}:
+        return "forecast"
+    if normalized in {"live", "paper_trade", "paper_account"}:
+        return "paper_trade"
+    return normalized or "unknown"
+
+
+def _paper_episode_payload(episode: PaperEpisode) -> dict[str, Any]:
+    payload = episode.model_dump()
+    payload["simulation_type"] = payload.get("simulation_type") or _simulation_type_for_episode_mode(episode.mode)
+    return payload
+
+
+def _paper_episodes_payload(user_id: str, limit: int = 200) -> dict[str, Any]:
+    ledger = _paper_episode_ledger(user_id)
+    book = ledger.load()
+    bounded_limit = max(1, min(int(limit or 200), 1000))
+    episodes = book.episodes[-bounded_limit:]
+    return {
+        "items": [_paper_episode_payload(episode) for episode in reversed(episodes)],
+        "count": len(book.episodes),
+        "summary": ledger.summary(),
+        "updated_at": book.updated_at,
+        "storage": str(_paper_episode_file(user_id)),
+    }
+
+
+def _action_direction(action: str) -> float:
+    normalized = str(action or "").strip().lower()
+    if normalized in {"buy", "overweight", "long", "strong_buy", "accumulate"}:
+        return 1.0
+    if normalized in {"sell", "underweight", "short", "strong_sell", "reduce"}:
+        return -1.0
+    return 0.0
+
+
+def _weighted_strategy_return(action: str, target_position_size: Any, asset_return: Any) -> float:
+    raw_return = _safe_float(asset_return) or 0.0
+    size = max(0.0, min(1.0, _safe_float(target_position_size) or 0.0))
+    return _action_direction(action) * size * raw_return
+
+
+def _quote_return_series(
+    quote: dict[str, Any],
+    *,
+    entry_price: float,
+    action: str,
+    target_position_size: Any,
+    start_date: str = "",
+) -> dict[str, Any]:
+    rows = []
+    for item in quote.get("history") or []:
+        if not isinstance(item, dict):
+            continue
+        price = _safe_float(item.get("close") or item.get("price"))
+        date_text = str(item.get("date") or item.get("time") or item.get("as_of") or "")[:10]
+        if price is None or not date_text:
+            continue
+        if start_date and date_text < start_date:
+            continue
+        asset_return = (price / entry_price) - 1.0 if entry_price else 0.0
+        rows.append(
+            {
+                "date": date_text,
+                "price": price,
+                "asset_return": asset_return,
+                "strategy_return": _weighted_strategy_return(action, target_position_size, asset_return),
+            }
+        )
+    latest_price = _safe_float(quote.get("price"))
+    latest_date = str(quote.get("as_of") or _today_iso())[:10]
+    if latest_price is not None and (not rows or rows[-1]["date"] != latest_date):
+        asset_return = (latest_price / entry_price) - 1.0 if entry_price else 0.0
+        rows.append(
+            {
+                "date": latest_date,
+                "price": latest_price,
+                "asset_return": asset_return,
+                "strategy_return": _weighted_strategy_return(action, target_position_size, asset_return),
+            }
+        )
+    return {
+        "rows": rows[-260:],
+        "latest": rows[-1] if rows else {},
+    }
+
+
+def _quote_history_price_rows(quote: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = []
+    for item in quote.get("history") or []:
+        if not isinstance(item, dict):
+            continue
+        price = _safe_float(item.get("close") or item.get("price"))
+        date_text = str(item.get("date") or item.get("time") or item.get("as_of") or "")[:10]
+        if price is None or not date_text:
+            continue
+        rows.append({"date": date_text, "price": price})
+    latest_price = _safe_float(quote.get("price"))
+    latest_date = str(quote.get("as_of") or "")[:10]
+    if latest_price is not None and latest_date:
+        existing = next((row for row in rows if row["date"] == latest_date), None)
+        if existing:
+            existing["price"] = latest_price
+        else:
+            rows.append({"date": latest_date, "price": latest_price})
+    return sorted(rows, key=lambda row: row["date"])
+
+
+def _actual_series_for_episode(
+    episode: PaperEpisode,
+    quote: dict[str, Any] | None,
+    *,
+    entry_price: float,
+) -> list[dict[str, Any]]:
+    if not quote or not entry_price:
+        return []
+    price_rows = _quote_history_price_rows(quote)
+    if not price_rows:
+        return []
+    signal_date = str(episode.signal_date or "")[:10]
+    start_index = 0
+    matched_entry_index = None
+    tolerance = max(abs(entry_price) * 0.0001, 0.000001)
+    for index, row in enumerate(price_rows):
+        if abs(float(row["price"]) - entry_price) <= tolerance:
+            matched_entry_index = index
+            break
+    if matched_entry_index is not None:
+        start_index = matched_entry_index
+    elif signal_date:
+        for index, row in enumerate(price_rows):
+            if row["date"] >= signal_date:
+                start_index = index
+                break
+    rows = []
+    for row in price_rows[start_index:]:
+        price = float(row["price"])
+        asset_return = (price / entry_price) - 1.0 if entry_price else 0.0
+        rows.append(
+            {
+                "date": row["date"],
+                "price": price,
+                "asset_return": asset_return,
+                "strategy_return": _weighted_strategy_return(episode.action, episode.target_position_size, asset_return),
+                "price_source": "real",
+            }
+        )
+    return rows[-260:]
+
+
+def _simulation_reconciliation(
+    forecast_rows: list[dict[str, Any]],
+    actual_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    forecast_by_date = {str(row.get("date") or ""): row for row in forecast_rows if row.get("date")}
+    covered = []
+    hits = 0
+    for actual in actual_rows:
+        forecast = forecast_by_date.get(str(actual.get("date") or ""))
+        if not forecast:
+            continue
+        simulated_return = _safe_float(forecast.get("strategy_return"))
+        actual_return = _safe_float(actual.get("strategy_return"))
+        simulated_price = _safe_float(forecast.get("price"))
+        actual_price = _safe_float(actual.get("price"))
+        if simulated_return is None or actual_return is None:
+            continue
+        if abs(simulated_return) < 0.000001 and abs(actual_return) < 0.000001:
+            hits += 1
+        elif simulated_return * actual_return > 0:
+            hits += 1
+        covered.append(
+            {
+                "date": actual.get("date"),
+                "covered_by_real": True,
+                "simulated_price": simulated_price,
+                "real_price": actual_price,
+                "price_error": (actual_price - simulated_price) if actual_price is not None and simulated_price is not None else None,
+                "simulated_return": simulated_return,
+                "real_return": actual_return,
+                "return_error": actual_return - simulated_return,
+            }
+        )
+    latest = covered[-1] if covered else {}
+    latest_error = _safe_float(latest.get("return_error"))
+    latest_real_return = _safe_float(latest.get("real_return"))
+    if not covered:
+        validity = "pending"
+    elif latest_error is not None and abs(latest_error) <= max(0.01, abs(latest_real_return or 0.0) * 0.35):
+        validity = "valid"
+    elif latest_real_return is not None and _safe_float(latest.get("simulated_return")) is not None and latest_real_return * float(latest["simulated_return"]) < 0:
+        validity = "invalidated"
+    else:
+        validity = "drifting"
+    return {
+        "covered_points": len(covered),
+        "total_actual_points": len(actual_rows),
+        "total_forecast_points": len(forecast_rows),
+        "hit_rate": hits / len(covered) if covered else 0.0,
+        "latest": latest,
+        "deviation": latest_error,
+        "validity": validity,
+        "points": covered[-120:],
+    }
+
+
+def _merged_forecast_actual_series(
+    forecast_rows: list[dict[str, Any]],
+    actual_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    actual_by_date = {str(row.get("date") or ""): row for row in actual_rows if row.get("date")}
+    merged = []
+    seen_dates = set()
+    for forecast in forecast_rows:
+        date_text = str(forecast.get("date") or "")
+        actual = actual_by_date.get(date_text)
+        row = dict(actual or forecast)
+        if actual:
+            row["forecast_price"] = forecast.get("price")
+            row["forecast_strategy_return"] = forecast.get("strategy_return")
+            row["covered_by_real"] = True
+        merged.append(row)
+        if date_text:
+            seen_dates.add(date_text)
+    for actual in actual_rows:
+        date_text = str(actual.get("date") or "")
+        if date_text and date_text not in seen_dates:
+            merged.append(dict(actual, covered_by_real=True))
+    return sorted(merged, key=lambda row: str(row.get("date") or ""))
+
+
+def _review_conclusion_from_comparison(comparison: dict[str, Any]) -> str:
+    validity = str(comparison.get("validity") or "")
+    covered_points = _safe_int((comparison.get("reconciliation") or {}).get("covered_points"), 0)
+    if covered_points <= 0:
+        return "等待真实行情回补。"
+    if validity == "valid":
+        return "真实走势仍在原推演可接受范围内。"
+    if validity == "invalidated":
+        return "真实走势已明显背离原推演方向。"
+    if validity == "drifting":
+        return "真实走势与原推演存在偏差，需继续观察。"
+    return "真实行情已部分覆盖原推演。"
+
+
+def _episode_public_comparison(episode: PaperEpisode, quote: dict[str, Any] | None = None) -> dict[str, Any]:
+    entry_price = _safe_float(episode.entry_price)
+    current_price = _safe_float((quote or {}).get("price")) or _safe_float(episode.current_price)
+    asset_return = (current_price / entry_price) - 1.0 if entry_price and current_price else None
+    strategy_return = _weighted_strategy_return(episode.action, episode.target_position_size, asset_return)
+    forecast_rows = []
+    for snapshot in episode.snapshots or []:
+        if not isinstance(snapshot, dict):
+            continue
+        positions = snapshot.get("positions") if isinstance(snapshot.get("positions"), dict) else {}
+        position = positions.get(episode.ticker) if isinstance(positions.get(episode.ticker), dict) else {}
+        price = _safe_float(position.get("last_price") or snapshot.get("price"))
+        date_text = str(snapshot.get("trade_date") or "")[:10]
+        if price is None or not date_text:
+            continue
+        base_price = entry_price or price
+        row_return = (price / base_price) - 1.0 if base_price else 0.0
+        forecast_rows.append(
+            {
+                "date": date_text,
+                "price": price,
+                "asset_return": row_return,
+                "strategy_return": _weighted_strategy_return(episode.action, episode.target_position_size, row_return),
+                "price_source": snapshot.get("price_source") or "real",
+            }
+        )
+    actual_rows = _actual_series_for_episode(episode, quote, entry_price=entry_price or current_price or 0.0)
+    if not forecast_rows:
+        series = _quote_return_series(
+            quote or {},
+            entry_price=entry_price or current_price or 0.0,
+            action=episode.action,
+            target_position_size=episode.target_position_size,
+            start_date=str(episode.signal_date or "")[:10],
+        ) if quote else {"rows": [], "latest": {}}
+        forecast_rows = series["rows"]
+    series_rows = _merged_forecast_actual_series(forecast_rows, actual_rows) if forecast_rows else actual_rows
+    reconciliation = _simulation_reconciliation(forecast_rows, actual_rows)
+    actual_latest = actual_rows[-1] if actual_rows else {}
+    return {
+        "episode_id": episode.episode_id,
+        "mode": episode.mode,
+        "simulation_type": episode.simulation_type or _simulation_type_for_episode_mode(episode.mode),
+        "ticker": episode.ticker,
+        "action": episode.action,
+        "target_position_size": episode.target_position_size,
+        "entry_price": entry_price,
+        "current_price": current_price,
+        "asset_return": asset_return,
+        "strategy_return": strategy_return,
+        "simulation_return": episode.final_return,
+        "actual_return": actual_latest.get("strategy_return", strategy_return),
+        "deviation": reconciliation.get("deviation"),
+        "hit_rate": reconciliation.get("hit_rate"),
+        "validity": reconciliation.get("validity"),
+        "final_return": episode.final_return,
+        "status": episode.status,
+        "horizon_days": episode.horizon_days,
+        "price_source_counts": (episode.tags or {}).get("price_source_counts") or (episode.tags or {}).get("simulation_config", {}).get("price_source_counts", {}),
+        "simulation_summary": (episode.tags or {}).get("simulation_summary", {}),
+        "data_mode": (episode.tags or {}).get("data_mode", ""),
+        "series": series_rows,
+        "forecast_series": forecast_rows,
+        "actual_series": actual_rows,
+        "reconciliation": reconciliation,
+    }
+
+
+def _simulation_final_state_from_payload(payload: dict[str, Any], action: str, target_position_size: float, horizon_days: int) -> dict[str, Any]:
+    return {
+        "final_trade_decision": str(payload.get("rating") or action or "Manual"),
+        "execution_plan": {
+            "action": action,
+            "target_position_size": target_position_size,
+            "risk_gate_approved": bool(payload.get("risk_gate_approved", True)),
+            "horizon_days": horizon_days,
+            "entry_price": _safe_float(payload.get("entry_price")) or 0.0,
+        },
+        "investment_debate_state": {
+            "signal_confidence": _safe_float(payload.get("confidence")) or 0.0,
+        },
+    }
+
+
+def _simulation_options_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "scenario": str(payload.get("simulation_scenario") or payload.get("scenario") or "base").strip().lower(),
+        "drift": payload.get("simulation_drift", payload.get("drift")),
+        "volatility": payload.get("simulation_volatility", payload.get("volatility")),
+        "seed": str(payload.get("simulation_seed") or payload.get("seed") or ""),
+        "num_paths": payload.get("simulation_paths", payload.get("num_paths")),
+    }
+
+
+def _conclusion_payload_for_simulation_episode(
+    episode: PaperEpisode,
+    payload: dict[str, Any],
+    quote: dict[str, Any],
+    *,
+    conclusion_id: str,
+) -> dict[str, Any]:
+    comparison = _episode_public_comparison(episode, quote)
+    snapshots = episode.snapshots if isinstance(episode.snapshots, list) else []
+    has_simulated_prices = any(str(snapshot.get("price_source") or "") == "simulated" for snapshot in snapshots)
+    return {
+        "conclusion_id": conclusion_id,
+        "source_run_id": episode.source_run_id,
+        "ticker": episode.ticker,
+        "asset_type": episode.asset_type,
+        "thesis": episode.thesis,
+        "rating": episode.rating,
+        "action": episode.action,
+        "target_position_size": episode.target_position_size,
+        "status": "tracking" if has_simulated_prices else ("due_review" if episode.resolved else "tracking"),
+        "analysis_date": episode.signal_date,
+        "horizon_days": episode.horizon_days,
+        "entry_price": episode.entry_price,
+        "current_price": comparison.get("current_price") or episode.current_price,
+        "raw_return": comparison.get("asset_return") or 0.0,
+        "execution_plan": episode.order,
+        "simulation_links": {
+            "forecast_episode_id": episode.episode_id,
+            "paper_episode_ids": [],
+            "backtest_episode_ids": [],
+        },
+        "comparison": comparison,
+        "simulation_summary": episode.tags.get("simulation_summary") if isinstance(episode.tags, dict) else {},
+    }
+
+
+def _create_forecast_observation(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    ticker = str(payload.get("ticker") or "").strip().upper()
+    asset_type = str(payload.get("asset_type") or "stock").strip().lower() or "stock"
+    if not ticker:
+        raise ValueError("missing_ticker")
+    quote = _live_market_quote(ticker, asset_type)
+    market_ticker = str(quote.get("market_ticker") or ticker).strip().upper()
+    entry_price_input = _safe_float(payload.get("entry_price"))
+    action = str(payload.get("action") or "hold").strip().lower() or "hold"
+    horizon_days = _safe_int(payload.get("horizon_days"), 20)
+    target_position_size = max(0.0, min(1.0, _safe_float(payload.get("target_position_size")) or 0.0))
+    source_run_id = str(payload.get("source_run_id") or "").strip()
+    if not source_run_id:
+        source_run_id = f"forecast-{market_ticker}-{str(quote.get('as_of') or _today_iso())[:10]}-{uuid.uuid4().hex[:8]}"
+    signal_date = str(payload.get("analysis_date") or quote.get("as_of") or _today_iso())[:10]
+    entry_price = entry_price_input or _safe_float(quote.get("price")) or 0.0
+    conclusion_id = str(payload.get("conclusion_id") or uuid.uuid4().hex[:12])
+    try:
+        graph = TradingAgentsGraph.__new__(TradingAgentsGraph)
+        graph.config = _build_run_config({"user_id": user_id, "asset_type": asset_type})
+        runner_entry_price = entry_price_input or (entry_price if signal_date >= _today_iso() else None)
+        simulation_payload = dict(payload)
+        if runner_entry_price:
+            simulation_payload["entry_price"] = runner_entry_price
+        else:
+            simulation_payload.pop("entry_price", None)
+        result = graph.run_paper_trade_from_final_state(
+            market_ticker,
+            signal_date,
+            _simulation_final_state_from_payload(simulation_payload, action, target_position_size, horizon_days),
+            holding_days=horizon_days,
+            initial_capital=_parse_initial_capital_input(str(payload.get("initial_cash") or "100000")),
+            commission_rate=_parse_rate_input(str(payload.get("commission_rate") or "0")),
+            slippage_rate=_parse_rate_input(str(payload.get("slippage_rate") or "0")),
+            asset_type=asset_type,
+            simulation_options=_simulation_options_from_payload(payload),
+        )
+        if result.resolved:
+            snapshot_sources = [
+                str(snapshot.price_source or "real")
+                for snapshot in result.snapshots
+            ]
+            simulated_days = len([item for item in snapshot_sources if item == "simulated"])
+            real_days = len(snapshot_sources) - simulated_days
+            if simulated_days and real_days:
+                data_mode = "mixed_real_simulated"
+            elif simulated_days:
+                data_mode = "simulated_path"
+            else:
+                data_mode = "real_history"
+            episode = _record_paper_result_episode(
+                user_id,
+                result,
+                "forward_test",
+                source_run_id=source_run_id,
+                thesis=str(payload.get("thesis") or ""),
+                confidence=_safe_float(payload.get("confidence")) or 0.0,
+                benchmark=str(payload.get("benchmark") or _resolve_benchmark_from_default_config(market_ticker)),
+                initial_capital=_parse_initial_capital_input(str(payload.get("initial_cash") or "100000")),
+                market_as_of=str(quote.get("as_of") or ""),
+                tags={
+                    "entrypoint": "api_simulation_run",
+                    "data_mode": data_mode,
+                    "real_price_points": real_days,
+                    "simulated_price_points": simulated_days,
+                    "price_source_counts": {
+                        "real": real_days,
+                        "simulated": simulated_days,
+                    },
+                    "simulation_config": result.simulation,
+                    "simulation_summary": result.simulation.get("scenario_summary", {}),
+                },
+            )
+            track = _conclusion_store(user_id).add_track(
+                _conclusion_payload_for_simulation_episode(
+                    episode,
+                    payload,
+                    quote,
+                    conclusion_id=conclusion_id,
+                )
+            )
+            return {
+                "ok": True,
+                "mode": "forward_test",
+                "data_mode": data_mode,
+                "quote": quote,
+                "episode": episode.model_dump(),
+                "track": track.public_payload(),
+                **_conclusions_payload(user_id),
+            }
+    except Exception:
+        pass
+    episode_id = make_episode_id(
+        mode="forward_test",
+        ticker=market_ticker,
+        signal_date=signal_date,
+        horizon_days=horizon_days,
+        source_run_id=source_run_id,
+        action=action,
+    )
+    asset_return = 0.0
+    episode = PaperEpisode(
+        episode_id=episode_id,
+        mode="forward_test",
+        simulation_type="forecast",
+        ticker=market_ticker,
+        asset_type=asset_type,
+        source_run_id=source_run_id,
+        signal_date=signal_date,
+        decision_date=signal_date,
+        execution_date=signal_date,
+        horizon_days=horizon_days,
+        benchmark=str(payload.get("benchmark") or _resolve_benchmark_from_default_config(market_ticker)),
+        thesis=str(payload.get("thesis") or ""),
+        rating=str(payload.get("rating") or "Forecast"),
+        action=action,
+        target_position_size=target_position_size,
+        confidence=max(0.0, min(1.0, _safe_float(payload.get("confidence")) or 0.0)),
+        risk_gate_approved=bool(payload.get("risk_gate_approved", True)),
+        entry_price=entry_price,
+        current_price=entry_price,
+        strategy_return=_weighted_strategy_return(action, target_position_size, asset_return),
+        status="tracking",
+        resolved=False,
+        order={
+            "ticker": market_ticker,
+            "asset_type": asset_type,
+            "rating": str(payload.get("rating") or "Forecast"),
+            "action": action,
+            "target_position_size": target_position_size,
+            "risk_gate_approved": bool(payload.get("risk_gate_approved", True)),
+            "source_run_id": source_run_id,
+            "thesis": str(payload.get("thesis") or ""),
+            "horizon_days": horizon_days,
+            "entry_price": entry_price,
+        },
+        snapshots=[
+            {
+                "trade_date": signal_date,
+                "price": entry_price,
+                "asset_return": 0.0,
+                "strategy_return": 0.0,
+            }
+        ],
+        market_data={
+            "symbol": market_ticker,
+            "as_of": str(quote.get("as_of") or signal_date),
+            "vendor": "route_to_vendor",
+            "staleness_days": quote_staleness_days(quote.get("as_of"), _today_iso()),
+        },
+        tags={
+            "entrypoint": "api_simulation_run_tracking",
+            "data_mode": "tracking_without_future_data",
+            "observe_only": not bool(payload.get("execute_paper_account")),
+        },
+    )
+    _paper_episode_ledger(user_id).upsert(episode)
+
+    track_payload = {
+        "conclusion_id": conclusion_id,
+        "source_run_id": source_run_id,
+        "ticker": market_ticker,
+        "asset_type": asset_type,
+        "thesis": str(payload.get("thesis") or ""),
+        "rating": str(payload.get("rating") or "Forecast"),
+        "action": action,
+        "target_position_size": target_position_size,
+        "status": "tracking",
+        "analysis_date": signal_date,
+        "horizon_days": horizon_days,
+        "entry_price": entry_price,
+        "current_price": entry_price,
+        "raw_return": 0.0,
+        "execution_plan": episode.order,
+        "simulation_links": {
+            "forecast_episode_id": episode.episode_id,
+            "paper_episode_ids": [],
+            "backtest_episode_ids": [],
+        },
+        "comparison": _episode_public_comparison(episode, quote),
+    }
+    track = _conclusion_store(user_id).add_track(track_payload)
+    return {
+        "ok": True,
+        "mode": "forward_test",
+        "quote": quote,
+        "episode": episode.model_dump(),
+        "track": track.public_payload(),
+        **_conclusions_payload(user_id),
+    }
+
+
+def _confidence_from_state(final_state: dict[str, Any] | None) -> float:
+    if not isinstance(final_state, dict):
+        return 0.0
+    try:
+        return float((final_state.get("investment_debate_state") or {}).get("signal_confidence") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _thesis_from_run_snapshot(snapshot: dict[str, Any] | None) -> str:
+    if not isinstance(snapshot, dict):
+        return ""
+    result = snapshot.get("result") if isinstance(snapshot.get("result"), dict) else {}
+    details = result.get("decision_details") if isinstance(result.get("decision_details"), dict) else {}
+    return str(
+        details.get("executive_summary")
+        or details.get("investment_thesis")
+        or result.get("summary")
+        or ""
+    ).strip()
+
+
+def _record_paper_result_episode(
+    user_id: str,
+    result: PaperTradingResult,
+    mode: str,
+    *,
+    source_run_id: str = "",
+    thesis: str = "",
+    confidence: float = 0.0,
+    benchmark: str = "",
+    initial_capital: float | None = None,
+    market_vendor: str = "",
+    market_as_of: str = "",
+    tags: dict[str, Any] | None = None,
+) -> PaperEpisode:
+    episode = PaperEpisode.from_paper_result(
+        result,
+        mode,
+        source_run_id=source_run_id,
+        thesis=thesis,
+        confidence=confidence,
+        benchmark=benchmark,
+        initial_capital=initial_capital,
+        market_vendor=market_vendor,
+        market_as_of=market_as_of,
+        reference_date=_today_iso(),
+        tags=tags,
+    )
+    _paper_episode_ledger(user_id).upsert(episode)
+    return episode
+
+
+def _record_backtest_result_episodes(
+    user_id: str,
+    result: BacktestResult,
+    *,
+    source_run_id: str = "",
+    thesis: str = "",
+    tags: dict[str, Any] | None = None,
+) -> list[PaperEpisode]:
+    ledger = _paper_episode_ledger(user_id)
+    episodes = []
+    for trade in result.trades:
+        episode = PaperEpisode.from_backtest_trade(
+            trade,
+            source_run_id=source_run_id,
+            thesis=thesis,
+            tags=tags,
+        )
+        ledger.upsert(episode)
+        episodes.append(episode)
+    return episodes
+
+
+def _run_manual_paper_replay(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    ticker = str(payload.get("ticker") or "").strip().upper()
+    asset_type = str(payload.get("asset_type") or "stock").strip().lower() or "stock"
+    trade_date = str(payload.get("trade_date") or "").strip()[:10]
+    if not ticker or not trade_date:
+        raise ValueError("missing_manual_replay_inputs")
+
+    market_ticker = _normalize_market_data_ticker(ticker, asset_type)
+    holding_days = _safe_int(payload.get("horizon_days") or payload.get("holding_days"), 20)
+    initial_cash = _parse_initial_capital_input(str(payload.get("initial_cash") or "100000"))
+    commission_rate = _parse_rate_input(str(payload.get("commission_rate") or "0"))
+    slippage_rate = _parse_rate_input(str(payload.get("slippage_rate") or "0"))
+    action = str(payload.get("action") or "buy").strip().lower()
+    target_position_size = float(payload.get("target_position_size") or 0.0)
+    thesis = str(payload.get("thesis") or "").strip()
+    final_state = {
+        "final_trade_decision": str(payload.get("rating") or action or "Manual"),
+        "execution_plan": {
+            "action": action,
+            "target_position_size": target_position_size,
+            "risk_gate_approved": bool(payload.get("risk_gate_approved", True)),
+            "horizon_days": holding_days,
+        },
+        "investment_debate_state": {
+            "signal_confidence": _safe_float(payload.get("confidence")) or 0.0,
+        },
+    }
+    graph = TradingAgentsGraph.__new__(TradingAgentsGraph)
+    graph.config = _build_run_config({"user_id": user_id, "asset_type": asset_type})
+    result = graph.run_paper_trade_from_final_state(
+        market_ticker,
+        trade_date,
+        final_state,
+        holding_days=holding_days,
+        initial_capital=initial_cash,
+        commission_rate=commission_rate,
+        slippage_rate=slippage_rate,
+        asset_type=asset_type,
+    )
+    account = _paper_replay_account_payload(result, initial_cash)
+    episode = _record_paper_result_episode(
+        user_id,
+        result,
+        "historical_replay",
+        source_run_id=str(payload.get("source_run_id") or f"manual-{market_ticker}-{trade_date}"),
+        thesis=thesis,
+        confidence=_safe_float(payload.get("confidence")) or 0.0,
+        initial_capital=initial_cash,
+        tags={
+            "entrypoint": "api_paper_replay_manual",
+            "commission_rate": commission_rate,
+            "slippage_rate": slippage_rate,
+        },
+    )
+    return {
+        "ok": True,
+        "mode": "historical_replay",
+        "manual": True,
+        "result": _paper_trading_result_payload(holding_days, result),
+        "episode": episode.model_dump(),
+        "account": _account_payload(account),
+        "analytics": _paper_analytics_payload(account, ticker=market_ticker),
+    }
+
+
+def _parse_price_payload_rows(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, str):
+        return []
+    csv_lines = [line for line in payload.splitlines() if line and not line.startswith("#")]
+    if not csv_lines:
+        return []
+    try:
+        return list(csv.DictReader(StringIO("\n".join(csv_lines))))
+    except Exception:
+        return []
+
+
+def _latest_market_quote(ticker: str, asset_type: str = "stock") -> dict[str, Any]:
+    market_ticker = _normalize_market_data_ticker(ticker, asset_type)
+    end = _now_local() + datetime.timedelta(days=1)
+    start = end - datetime.timedelta(days=180)
+    payload = route_to_vendor(
+        "get_stock_data",
+        market_ticker,
+        start.strftime("%Y-%m-%d"),
+        end.strftime("%Y-%m-%d"),
+    )
+    rows = _parse_price_payload_rows(payload)
+    parsed_rows = []
+    for row in rows:
+        try:
+            close = float(row.get("Close") or row.get("close") or "")
+        except (TypeError, ValueError):
+            continue
+        parsed_rows.append(
+            {
+                "date": str(row.get("Date") or row.get("date") or "")[:10],
+                "open": _safe_float(row.get("Open") or row.get("open")),
+                "high": _safe_float(row.get("High") or row.get("high")),
+                "low": _safe_float(row.get("Low") or row.get("low")),
+                "close": close,
+                "volume": _safe_float(row.get("Volume") or row.get("volume")),
+            }
+        )
+    if not parsed_rows:
+        raise ValueError(f"No price data available for {market_ticker}")
+    latest = parsed_rows[-1]
+    previous = parsed_rows[-2] if len(parsed_rows) >= 2 else None
+    change = latest["close"] - previous["close"] if previous else 0.0
+    change_percent = change / previous["close"] if previous and previous["close"] else 0.0
+    return {
+        "ticker": str(ticker).strip().upper(),
+        "market_ticker": market_ticker,
+        "asset_type": asset_type,
+        "price": latest["close"],
+        "as_of": latest["date"],
+        "change": change,
+        "change_percent": change_percent,
+        "history": parsed_rows[-180:],
+        "updated_at": _now_iso(),
+    }
+
+
+def _intraday_market_quote(ticker: str, asset_type: str = "stock") -> dict[str, Any]:
+    quote = _latest_market_quote(ticker, asset_type)
+    market_ticker = str(quote.get("market_ticker") or _normalize_market_data_ticker(ticker, asset_type))
+    today = _now_local().date()
+    rows: list[dict[str, Any]] = []
+    try:
+        import yfinance as yf
+
+        from tradingagents.dataflows.stockstats_utils import yf_retry
+
+        data = yf_retry(lambda: yf.Ticker(market_ticker.upper()).history(period="1d", interval="1m"))
+        if not data.empty:
+            for index, row in data.iterrows():
+                timestamp = index.to_pydatetime() if hasattr(index, "to_pydatetime") else index
+                if getattr(timestamp, "tzinfo", None) is not None:
+                    timestamp = timestamp.astimezone(_workbench_tz())
+                close = _safe_float(row.get("Close") if hasattr(row, "get") else None)
+                if close is None:
+                    continue
+                if getattr(timestamp, "date", lambda: None)() != today:
+                    continue
+                rows.append(
+                    {
+                        "time": timestamp.isoformat(timespec="seconds"),
+                        "price": close,
+                        "open": _safe_float(row.get("Open")),
+                        "high": _safe_float(row.get("High")),
+                        "low": _safe_float(row.get("Low")),
+                        "volume": _safe_float(row.get("Volume")),
+                    }
+                )
+    except Exception:
+        rows = []
+
+    if not rows:
+        rows = [
+            {
+                "time": str(quote.get("as_of") or _now_iso()),
+                "price": _safe_float(quote.get("price")) or 0.0,
+                "open": _safe_float(quote.get("price")),
+                "high": _safe_float(quote.get("price")),
+                "low": _safe_float(quote.get("price")),
+                "volume": None,
+            }
+        ]
+
+    previous_price = rows[0]["price"] if rows else _safe_float(quote.get("price")) or 0.0
+    latest_price = rows[-1]["price"] if rows else _safe_float(quote.get("price")) or 0.0
+    change = latest_price - previous_price if previous_price is not None else 0.0
+    quote.update(
+        {
+            "price": latest_price,
+            "as_of": rows[-1]["time"] if rows else quote.get("as_of"),
+            "change": change,
+            "change_percent": change / previous_price if previous_price else 0.0,
+            "intraday": rows,
+            "intraday_date": today.isoformat(),
+            "interval": "1m",
+        }
+    )
+    return quote
+
+
+def _live_market_quote(ticker: str, asset_type: str = "stock") -> dict[str, Any]:
+    try:
+        return _intraday_market_quote(ticker, asset_type)
+    except Exception:
+        return _latest_market_quote(ticker, asset_type)
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: Any, default: int = 20) -> int:
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
+        return default
+    return max(1, parsed)
+
+
+def _paper_market_history_enabled(ticker: str) -> bool:
+    symbol = str(ticker or "").strip().upper()
+    base = symbol.split("-")[0].split("/")[0]
+    return base in {"BTC", "XBT", "ETH"}
+
+
+def _remember_paper_market_history(account: dict[str, Any], quote: dict[str, Any]) -> bool:
+    market_ticker = str(quote.get("market_ticker") or quote.get("ticker") or "").strip().upper()
+    history = quote.get("history")
+    if not _paper_market_history_enabled(market_ticker):
+        return False
+    if not market_ticker or not isinstance(history, list):
+        return False
+    cleaned = []
+    for row in history:
+        if not isinstance(row, dict):
+            continue
+        close = _safe_float(row.get("close"))
+        date = str(row.get("date") or "")[:10]
+        if close is None or not date:
+            continue
+        cleaned.append(
+            {
+                "date": date,
+                "open": _safe_float(row.get("open")),
+                "high": _safe_float(row.get("high")),
+                "low": _safe_float(row.get("low")),
+                "close": close,
+                "volume": _safe_float(row.get("volume")),
+            }
+        )
+    if not cleaned:
+        return False
+    by_date = {
+        str(row.get("date")): row
+        for row in ((account.get("market_history") or {}).get(market_ticker) or [])
+        if isinstance(row, dict) and row.get("date")
+    }
+    for row in cleaned:
+        by_date[row["date"]] = row
+    account.setdefault("market_history", {})[market_ticker] = [
+        by_date[key] for key in sorted(by_date.keys())
+    ][-260:]
+    return True
+
+
+def _mark_paper_account(user_id: str, ticker: str = "", asset_type: str = "stock") -> dict[str, Any]:
+    account = _load_paper_account(user_id)
+    prices: dict[str, float] = {}
+    quote = None
+    symbols = set(account.get("positions", {}).keys())
+    if ticker:
+        symbols.add(_normalize_market_data_ticker(ticker, asset_type))
+    for symbol in symbols:
+        try:
+            quote = _live_market_quote(symbol, asset_type)
+            prices[str(quote["market_ticker"])] = float(quote["price"])
+            _remember_paper_market_history(account, quote)
+        except Exception:
+            continue
+    broker = _broker_from_account(account)
+    if prices:
+        snapshot = broker.snapshot(_now_iso(), prices)
+        account["cash"] = broker.cash
+        account["positions"] = {
+            ticker: position.model_dump()
+            for ticker, position in broker.positions.items()
+        }
+        account.setdefault("snapshots", []).append(snapshot.model_dump())
+        account["snapshots"] = account["snapshots"][-240:]
+        _save_paper_account(user_id, account)
+    payload = _account_payload(account)
+    payload["quote"] = quote
+    return payload
+
+
+def _submit_paper_order(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    ticker = str(payload.get("ticker") or "").strip().upper()
+    asset_type = str(payload.get("asset_type") or "stock").strip().lower() or "stock"
+    if not ticker:
+        raise ValueError("missing_ticker")
+    quote = _live_market_quote(ticker, asset_type)
+    market_ticker = str(quote["market_ticker"])
+    account = _load_paper_account(user_id)
+    _remember_paper_market_history(account, quote)
+    commission_rate = _parse_rate_input(str(payload.get("commission_rate") or "0"))
+    slippage_rate = _parse_rate_input(str(payload.get("slippage_rate") or "0"))
+    broker = _broker_from_account(account, commission_rate=commission_rate, slippage_rate=slippage_rate)
+    order = PaperOrder(
+        ticker=market_ticker,
+        trade_date=str(quote.get("as_of") or _today_iso()),
+        asset_type=asset_type,
+        rating=str(payload.get("rating") or payload.get("action") or "Manual"),
+        action=str(payload.get("action") or "buy").strip().lower(),
+        target_position_size=float(payload.get("target_position_size") or 0.0),
+        risk_gate_approved=bool(payload.get("risk_gate_approved", True)),
+        source_run_id=str(payload.get("source_run_id") or ""),
+        thesis=str(payload.get("thesis") or ""),
+        horizon_days=_safe_int(payload.get("horizon_days"), 20),
+    )
+    fill = broker.submit_order(order, float(quote["price"]))
+    snapshot = broker.snapshot(_now_iso(), {market_ticker: float(quote["price"])})
+    account["cash"] = broker.cash
+    account["positions"] = {
+        symbol: position.model_dump()
+        for symbol, position in broker.positions.items()
+    }
+    if fill is not None:
+        fills = account.setdefault("fills", [])
+        fills.append(fill.model_dump())
+        account["fills"] = fills[-500:]
+    snapshots = account.setdefault("snapshots", [])
+    snapshots.append(snapshot.model_dump())
+    account["snapshots"] = snapshots[-240:]
+    _save_paper_account(user_id, account)
+    paper_result = PaperTradingResult(
+        ticker=market_ticker,
+        trade_date=order.trade_date,
+        holding_days=order.horizon_days,
+        resolved=True,
+        order=order,
+        fills=[fill] if fill is not None else [],
+        snapshots=[snapshot],
+    )
+    episode = _record_paper_result_episode(
+        user_id,
+        paper_result,
+        "live",
+        source_run_id=order.source_run_id,
+        thesis=order.thesis,
+        confidence=_safe_float(payload.get("confidence")) or 0.0,
+        initial_capital=float(account.get("initial_cash") or 0.0),
+        market_as_of=str(quote.get("as_of") or ""),
+        tags={
+            "entrypoint": str(payload.get("entrypoint") or "api_paper_order"),
+            "commission_rate": commission_rate,
+            "slippage_rate": slippage_rate,
+            **(payload.get("tags") if isinstance(payload.get("tags"), dict) else {}),
+        },
+    )
+    return {
+        "ok": True,
+        "quote": quote,
+        "order": order.model_dump(),
+        "fill": fill.model_dump() if fill else None,
+        "episode": episode.model_dump(),
+        "account": _account_payload(account),
+    }
+
+
+def _paper_signals_for_user(user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    signals = []
+    for item in _load_persisted_history(user_id, limit=limit):
+        final_state = item.get("final_state") if isinstance(item.get("final_state"), dict) else {}
+        attachments = item.get("attachments") if isinstance(item.get("attachments"), dict) else {}
+        execution_plan = attachments.get("execution_plan") or (final_state.get("execution_plan") if final_state else {})
+        if not execution_plan:
+            continue
+        signals.append(
+            {
+                "run_id": item.get("run_id"),
+                "ticker": item.get("ticker") or (item.get("payload") or {}).get("ticker"),
+                "asset_type": (item.get("payload") or {}).get("asset_type", "stock"),
+                "analysis_date": (item.get("payload") or {}).get("analysis_date"),
+                "rating": item.get("result", {}).get("rating"),
+                "summary": item.get("result", {}).get("summary"),
+                "execution_plan": execution_plan,
+            }
+        )
+    return signals
+
+
+def _conclusions_payload(user_id: str) -> dict[str, Any]:
+    store = _conclusion_store(user_id)
+    book = store.load()
+    tracks = [track.with_lifecycle_status() for track in book.tracks]
+    episodes = _paper_episode_ledger(user_id).load().episodes
+    episodes_by_id = {episode.episode_id: episode for episode in episodes}
+    episodes_by_source: dict[str, list[PaperEpisode]] = {}
+    for episode in episodes:
+        if episode.source_run_id:
+            episodes_by_source.setdefault(episode.source_run_id, []).append(episode)
+    items = []
+    for index, track in enumerate(tracks):
+        payload = track.public_payload()
+        linked = payload.get("simulation_links") if isinstance(payload.get("simulation_links"), dict) else {}
+        candidate_ids = [
+            linked.get("forecast_episode_id"),
+            *list(linked.get("paper_episode_ids") or []),
+            *list(linked.get("backtest_episode_ids") or []),
+        ]
+        linked_episodes = [
+            episodes_by_id[episode_id]
+            for episode_id in candidate_ids
+            if episode_id and episode_id in episodes_by_id
+        ]
+        if not linked_episodes and track.source_run_id:
+            linked_episodes = episodes_by_source.get(track.source_run_id, [])
+        quote = None
+        if index < 20 and track.ticker:
+            try:
+                quote = _live_market_quote(track.ticker, track.asset_type)
+            except Exception:
+                quote = None
+        comparisons = [_episode_public_comparison(episode, quote) for episode in linked_episodes]
+        primary_comparison = comparisons[0] if comparisons else payload.get("comparison", {})
+        entry_price = _safe_float(payload.get("entry_price")) or (comparisons[0].get("entry_price") if comparisons else None)
+        current_price = _safe_float((quote or {}).get("price")) or _safe_float(payload.get("current_price"))
+        if entry_price and current_price:
+            raw_return = (current_price / entry_price) - 1.0
+            payload["current_price"] = current_price
+            payload["current_return"] = raw_return
+            payload["raw_return"] = raw_return
+            payload["strategy_return"] = _weighted_strategy_return(track.action, track.target_position_size, raw_return)
+        payload["simulations"] = comparisons
+        payload["comparison"] = primary_comparison
+        payload["simulation_return"] = primary_comparison.get("simulation_return")
+        payload["actual_return"] = primary_comparison.get("actual_return")
+        payload["simulation_deviation"] = primary_comparison.get("deviation")
+        payload["hit_rate"] = primary_comparison.get("hit_rate")
+        payload["validity"] = primary_comparison.get("validity")
+        payload["review_conclusion"] = _review_conclusion_from_comparison(primary_comparison)
+        items.append(payload)
+    return {
+        "items": items,
+        "summary": summarize_conclusions(tracks),
+        "updated_at": book.updated_at,
+        "storage": str(_conclusions_file(user_id)),
+    }
+
+
+def _run_snapshot_for_user(user_id: str, run_id: str) -> dict[str, Any] | None:
+    run = RUNS.get(run_id)
+    if run and _sanitize_user_id(str(run.get("user_id") or "local")) == _sanitize_user_id(user_id):
+        return run
+    return _load_persisted_run(run_id, user_id)
+
+
+def _time_horizon_days(value: Any, default: int = 20) -> int:
+    match = re.search(r"\d+", str(value or ""))
+    if not match:
+        return default
+    return max(1, int(match.group(0)))
+
+
+def _conclusion_track_from_run_snapshot(
+    snapshot: dict[str, Any],
+    overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    overrides = dict(overrides or {})
+    payload = snapshot.get("payload") if isinstance(snapshot.get("payload"), dict) else {}
+    final_state = snapshot.get("final_state") if isinstance(snapshot.get("final_state"), dict) else {}
+    attachments = snapshot.get("attachments") if isinstance(snapshot.get("attachments"), dict) else {}
+    result = snapshot.get("result") if isinstance(snapshot.get("result"), dict) else {}
+    details = result.get("decision_details") if isinstance(result.get("decision_details"), dict) else {}
+    execution_plan = (
+        attachments.get("execution_plan")
+        or final_state.get("execution_plan")
+        or {}
+    )
+    factor_detail = attachments.get("factor_runtime_detail") if isinstance(attachments.get("factor_runtime_detail"), dict) else {}
+    target_size = execution_plan.get("target_position_size", details.get("target_position_size", 0.0))
+    try:
+        target_size = float(target_size or 0.0)
+    except (TypeError, ValueError):
+        target_size = 0.0
+
+    return {
+        "source_run_id": str(snapshot.get("run_id") or overrides.get("run_id") or ""),
+        "ticker": str(snapshot.get("ticker") or payload.get("ticker") or overrides.get("ticker") or "").strip().upper(),
+        "asset_type": str(payload.get("asset_type") or overrides.get("asset_type") or "stock").strip().lower() or "stock",
+        "thesis": str(overrides.get("thesis") or details.get("executive_summary") or result.get("summary") or "").strip(),
+        "rating": str(overrides.get("rating") or result.get("rating") or details.get("rating") or "").strip(),
+        "action": str(overrides.get("action") or execution_plan.get("action") or "").strip().lower() or "hold",
+        "target_position_size": target_size,
+        "status": str(overrides.get("status") or "tracking"),
+        "analysis_date": str(payload.get("analysis_date") or overrides.get("analysis_date") or ""),
+        "horizon_days": int(overrides.get("horizon_days") or execution_plan.get("horizon_days") or _time_horizon_days(details.get("time_horizon"), 20)),
+        "entry_price": overrides.get("entry_price"),
+        "current_price": overrides.get("current_price"),
+        "factor_score": factor_detail or final_state.get("factor_score", {}) or {},
+        "risk_gate_result": final_state.get("risk_gate_result", {}) or {},
+        "execution_plan": execution_plan,
+    }
+
+
 def _append_report_evaluation_to_report(report_file: Path, evaluation_file: Path) -> None:
     if not report_file.exists() or not evaluation_file.exists():
         return
@@ -1233,7 +2652,7 @@ def _save_report_to_disk(final_state: dict[str, Any], ticker: str, save_path: Pa
 
     header = (
         f"# Trading Analysis Report: {ticker}\n\n"
-        f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"Generated: {_now_local().strftime('%Y-%m-%d %H:%M:%S %Z')}\n\n"
     )
     report_file = save_path / "complete_report.md"
     report_file.write_text(header + "\n\n".join(sections), encoding="utf-8")
@@ -1569,7 +2988,7 @@ def _append_log(run: dict[str, Any], message: str) -> None:
 def _append_event(run: dict[str, Any], kind: str, message: str, data: dict[str, Any] | None = None) -> None:
     run.setdefault("events", []).append(
         {
-            "ts": datetime.datetime.now().isoformat(),
+            "ts": _now_iso(),
             "kind": kind,
             "message": message,
             "phase": run.get("phase", ""),
@@ -1613,7 +3032,7 @@ def _mark_run_cancelled(run: dict[str, Any], message: str | None = None) -> None
     run["phase"] = "已取消"
     run["progress"] = max(int(run.get("progress") or 0), 100)
     run["elapsed"] = _now_elapsed(run["started_at"])
-    run["updated_at"] = datetime.datetime.now().isoformat()
+    run["updated_at"] = _now_iso()
     run["resume_hint"] = (
         "任务已取消，如 checkpoint 仍存在，可重新运行尝试恢复"
         if run.get("checkpoint_enabled")
@@ -1635,7 +3054,7 @@ def _mark_run_cancelled(run: dict[str, Any], message: str | None = None) -> None
 
 def _request_run_cancellation(run: dict[str, Any], message: str | None = None) -> None:
     run["cancel_requested"] = True
-    run["updated_at"] = datetime.datetime.now().isoformat()
+    run["updated_at"] = _now_iso()
     if run.get("slot_acquired") or run.get("status") == "running":
         run["status"] = "cancelling"
         run["phase"] = "取消中，等待当前调用返回并释放执行槽"
@@ -2533,6 +3952,8 @@ def _run_real_analysis(run_id: str) -> None:
             _build_asset_type_diagnostic(ticker, asset_type)
             or _build_data_availability_diagnostic(final_state)
         )
+        run["attachments"]["execution_plan"] = final_state.get("execution_plan", {}) or {}
+        run["attachments"]["final_trade_decision"] = final_state.get("final_trade_decision", "")
         output_language = str(payload.get("output_language") or "")
         run["agent_outputs"] = _extract_agent_outputs(final_state, output_language)
         run["report_sections"] = _extract_report_sections(final_state, output_language)
@@ -2544,7 +3965,7 @@ def _run_real_analysis(run_id: str) -> None:
 
         report_root = None
         report_file = None
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = _now_local().strftime("%Y%m%d_%H%M%S")
         if payload.get("save_report"):
             _update_phase(run, "保存报告", 60, "[report] 正在保存分析报告")
             report_root = _report_root_for_user(user_id) / f"{ticker}_{timestamp}"
@@ -2610,6 +4031,7 @@ def _run_real_analysis(run_id: str) -> None:
             )
             summary_results: list[tuple[int, Any]] = []
             backtest_save_dir = report_root / "6_backtests" if report_root is not None else None
+            backtest_episode_ids = []
             for holding_days in holding_days_list:
                 result = graph.run_backtest_from_final_states(
                     [scenario],
@@ -2626,6 +4048,20 @@ def _run_real_analysis(run_id: str) -> None:
                         holding_days,
                         backtest_save_dir,
                     )
+                try:
+                    episodes = _record_backtest_result_episodes(
+                        user_id,
+                        result,
+                        source_run_id=run_id,
+                        thesis=_thesis_from_run_snapshot(run),
+                        tags={
+                            "entrypoint": "analysis_run_backtest",
+                            "holding_days": holding_days,
+                        },
+                    )
+                    backtest_episode_ids.extend([episode.episode_id for episode in episodes])
+                except Exception as error:
+                    _append_log(run, f"[ledger] 回测账本写入失败: {error}")
             if backtest_save_dir is not None:
                 summary_file = _save_backtest_summary_to_disk(
                     summary_results,
@@ -2659,7 +4095,126 @@ def _run_real_analysis(run_id: str) -> None:
             run["attachments"]["backtest_enabled"] = True
             run["attachments"]["backtest_summary"] = " | ".join(metrics_preview)
             run["attachments"]["backtest_detail"] = backtest_detail
+            run["attachments"]["backtest_episode_ids"] = backtest_episode_ids
             _append_log(run, "[backtest] 回测已完成")
+
+        if payload.get("run_paper_trading"):
+            if _run_cancel_requested(run):
+                _mark_run_cancelled(run, "[cancel] 已取消，跳过模拟盘")
+                return
+            _update_phase(run, "运行模拟盘", 86, "[simulation] 正在运行推演模拟盘或执行历史回放")
+            paper_initial_capital = _parse_initial_capital_input(
+                str(payload.get("paper_initial_capital") or payload.get("backtest_initial_capital") or "100000")
+            )
+            paper_holding_days_list = _parse_holding_days_input(
+                str(payload.get("paper_holding_days") or payload.get("backtest_holding_days") or "5,10,20")
+            )
+            paper_commission_rate = _parse_rate_input(str(payload.get("paper_commission_rate") or "0"))
+            paper_slippage_rate = _parse_rate_input(str(payload.get("paper_slippage_rate") or "0"))
+            paper_ticker = _normalize_market_data_ticker(ticker, asset_type)
+            if paper_ticker != ticker:
+                _append_log(run, f"[paper] 已将 {ticker} 标准化为行情代码 {paper_ticker}")
+            paper_save_dir = report_root / "8_paper_trading" if report_root is not None else None
+            paper_detail = []
+            paper_preview = []
+            paper_episode_ids = []
+            paper_benchmark = graph._resolve_benchmark(paper_ticker)
+            execution_plan = final_state.get("execution_plan") if isinstance(final_state.get("execution_plan"), dict) else {}
+            for holding_days in paper_holding_days_list:
+                if analysis_date >= _today_iso():
+                    try:
+                        forecast_payload = _create_forecast_observation(
+                            user_id,
+                            {
+                                "ticker": paper_ticker,
+                                "asset_type": asset_type,
+                                "analysis_date": analysis_date,
+                                "action": execution_plan.get("action") or "hold",
+                                "rating": final_state.get("final_trade_decision") or "Forecast",
+                                "target_position_size": execution_plan.get("target_position_size") or 0.0,
+                                "risk_gate_approved": execution_plan.get("risk_gate_approved", True),
+                                "source_run_id": run_id,
+                                "thesis": _thesis_from_run_snapshot(run),
+                                "horizon_days": holding_days,
+                                "confidence": _confidence_from_state(final_state),
+                                "benchmark": paper_benchmark,
+                            },
+                        )
+                        episode_payload = forecast_payload.get("episode") or {}
+                        item = {
+                            "holding_days": holding_days,
+                            "resolved": False,
+                            "mode": "forward_test",
+                            "episode_id": episode_payload.get("episode_id"),
+                            "episode": episode_payload,
+                            "track": forecast_payload.get("track"),
+                        }
+                        paper_detail.append(item)
+                        if episode_payload.get("episode_id"):
+                            paper_episode_ids.append(episode_payload["episode_id"])
+                        paper_preview.append(f"{holding_days}d: forecast observation tracking")
+                    except Exception as error:
+                        _append_log(run, f"[ledger] 推演模拟盘写入失败: {error}")
+                        paper_preview.append(f"{holding_days}d: forecast observation failed")
+                    continue
+                result = graph.run_paper_trade_from_final_state(
+                    paper_ticker,
+                    analysis_date,
+                    final_state,
+                    holding_days=holding_days,
+                    initial_capital=paper_initial_capital,
+                    commission_rate=paper_commission_rate,
+                    slippage_rate=paper_slippage_rate,
+                    asset_type=asset_type,
+                )
+                if paper_save_dir is not None:
+                    _save_paper_trading_result_to_disk(
+                        result,
+                        ticker,
+                        analysis_date,
+                        holding_days,
+                        paper_save_dir,
+                    )
+                item = _paper_trading_result_payload(holding_days, result)
+                try:
+                    episode = _record_paper_result_episode(
+                        user_id,
+                        result,
+                        "historical_replay",
+                        source_run_id=run_id,
+                        thesis=_thesis_from_run_snapshot(run),
+                        confidence=_confidence_from_state(final_state),
+                        benchmark=paper_benchmark,
+                        initial_capital=paper_initial_capital,
+                        tags={
+                            "entrypoint": "analysis_run_paper_trading",
+                            "holding_days": holding_days,
+                            "commission_rate": paper_commission_rate,
+                            "slippage_rate": paper_slippage_rate,
+                        },
+                    )
+                    item["episode_id"] = episode.episode_id
+                    paper_episode_ids.append(episode.episode_id)
+                except Exception as error:
+                    _append_log(run, f"[ledger] 模拟盘账本写入失败: {error}")
+                paper_detail.append(item)
+                if result.resolved and result.snapshots:
+                    last = result.snapshots[-1]
+                    paper_preview.append(
+                        f"{holding_days}d: equity {last.equity:,.2f}, return {last.total_return:.2%}"
+                    )
+                else:
+                    paper_preview.append(f"{holding_days}d: {result.reason or 'no resolved price data'}")
+            run["attachments"]["paper_trading_enabled"] = True
+            run["attachments"]["paper_trading_summary"] = " | ".join(paper_preview)
+            run["attachments"]["paper_trading_detail"] = paper_detail
+            run["attachments"]["paper_trading_config"] = {
+                "initial_capital": paper_initial_capital,
+                "commission_rate": paper_commission_rate,
+                "slippage_rate": paper_slippage_rate,
+            }
+            run["attachments"]["paper_episode_ids"] = paper_episode_ids
+            _append_log(run, "[simulation] 模拟盘记录已完成")
 
         if payload.get("run_alpha_mining"):
             if _run_cancel_requested(run):
@@ -2694,7 +4249,7 @@ def _run_real_analysis(run_id: str) -> None:
         _update_phase(run, "完成", 100, f"[done] {ticker} 分析完成")
         run["status"] = "completed"
         run["elapsed"] = _now_elapsed(run["started_at"])
-        run["updated_at"] = datetime.datetime.now().isoformat()
+        run["updated_at"] = _now_iso()
         run["checkpoint_available"] = False
         run["resume_hint"] = "本次任务已完成，checkpoint 已清理"
         for agent in list(run.get("agent_status", {}).keys()):
@@ -2728,7 +4283,7 @@ def _run_real_analysis(run_id: str) -> None:
             "position": "N/A",
             "summary": str(error),
         }
-        run["updated_at"] = datetime.datetime.now().isoformat()
+        run["updated_at"] = _now_iso()
         _refresh_runtime_metrics(run, metrics_handler)
         _append_event(run, "error", run["error_message"])
         _persist_run_snapshot(run)
@@ -2740,6 +4295,14 @@ def _run_real_analysis(run_id: str) -> None:
 class TradingAgentsWorkbenchHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
+
+    def end_headers(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path in {"/", "/index.html", "/app.js", "/styles.css"}:
+            self.send_header("Cache-Control", "no-store, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+        super().end_headers()
 
     def _send_json(self, status: int, payload: dict[str, Any], headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -2775,6 +4338,11 @@ class TradingAgentsWorkbenchHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        canonical_path = _canonical_api_path(parsed.path)
+        if canonical_path != parsed.path:
+            parsed = parsed._replace(path=canonical_path)
+            self.path = canonical_path + (f"?{parsed.query}" if parsed.query else "")
+        api_path = parsed.path.rstrip("/") if parsed.path.startswith("/api/") else parsed.path
 
         if parsed.path == "/api/auth/session":
             session = _current_auth_session(self)
@@ -2861,6 +4429,85 @@ class TradingAgentsWorkbenchHandler(SimpleHTTPRequestHandler):
             self._send_json(200, _load_alpha_factors_for_ticker(ticker, user_id=user_id))
             return
 
+        if api_path == "/api/conclusions":
+            user_id = _request_user_id(self)
+            self._send_json(200, _conclusions_payload(user_id))
+            return
+
+        if parsed.path == "/api/paper/account":
+            query = parse_qs(parsed.query)
+            ticker = str((query.get("ticker") or [""])[0]).strip().upper()
+            asset_type = str((query.get("asset_type") or ["stock"])[0] or "stock")
+            user_id = _request_user_id(self)
+            self._send_json(200, _mark_paper_account(user_id, ticker=ticker, asset_type=asset_type))
+            return
+
+        if parsed.path == "/api/paper/quote":
+            query = parse_qs(parsed.query)
+            ticker = str((query.get("ticker") or [""])[0]).strip().upper()
+            asset_type = str((query.get("asset_type") or ["stock"])[0] or "stock")
+            if not ticker:
+                self._send_json(400, {"error": "missing_ticker"})
+                return
+            try:
+                quote = _live_market_quote(ticker, asset_type)
+                user_id = _request_user_id(self)
+                account = _load_paper_account(user_id)
+                if _remember_paper_market_history(account, quote):
+                    _save_paper_account(user_id, account)
+                self._send_json(200, quote)
+            except Exception as error:
+                self._send_json(502, {"error": "quote_unavailable", "message": str(error)})
+            return
+
+        if parsed.path == "/api/paper/intraday":
+            query = parse_qs(parsed.query)
+            ticker = str((query.get("ticker") or [""])[0]).strip().upper()
+            asset_type = str((query.get("asset_type") or ["stock"])[0] or "stock")
+            if not ticker:
+                self._send_json(400, {"error": "missing_ticker"})
+                return
+            try:
+                self._send_json(200, _intraday_market_quote(ticker, asset_type))
+            except Exception as error:
+                self._send_json(502, {"error": "intraday_unavailable", "message": str(error)})
+            return
+
+        if parsed.path == "/api/paper/signals":
+            user_id = _request_user_id(self)
+            self._send_json(200, {"items": _paper_signals_for_user(user_id)})
+            return
+
+        if parsed.path == "/api/paper/skills":
+            self._send_json(200, {"items": list_paper_analytics_skills()})
+            return
+
+        if parsed.path == "/api/paper/analytics":
+            query = parse_qs(parsed.query)
+            requested = [
+                item.strip()
+                for item in str((query.get("skills") or [""])[0]).split(",")
+                if item.strip()
+            ]
+            ticker = str((query.get("ticker") or [""])[0]).strip().upper()
+            user_id = _request_user_id(self)
+            self._send_json(
+                200,
+                _paper_analytics_payload(
+                    _load_paper_account(user_id),
+                    requested=requested or None,
+                    ticker=ticker,
+                ),
+            )
+            return
+
+        if parsed.path == "/api/paper/episodes":
+            query = parse_qs(parsed.query)
+            limit = _safe_int((query.get("limit") or ["200"])[0], 200)
+            user_id = _request_user_id(self)
+            self._send_json(200, _paper_episodes_payload(user_id, limit=limit))
+            return
+
         if parsed.path == "/api/history":
             query = parse_qs(parsed.query)
             limit = int((query.get("limit") or ["50"])[0] or "50")
@@ -2935,13 +4582,21 @@ class TradingAgentsWorkbenchHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             return
 
-        if parsed.path in {"/", "/index.html"}:
+        if parsed.path in {"/", "/index.html"} or (
+            not parsed.path.startswith("/api/")
+            and not Path(parsed.path).suffix
+        ):
             self.path = "/index.html"
 
         return super().do_GET()
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        canonical_path = _canonical_api_path(parsed.path)
+        if canonical_path != parsed.path:
+            parsed = parsed._replace(path=canonical_path)
+            self.path = canonical_path + (f"?{parsed.query}" if parsed.query else "")
+        api_path = parsed.path.rstrip("/") if parsed.path.startswith("/api/") else parsed.path
         content_length = int(self.headers.get("Content-Length", "0"))
         raw_body = self.rfile.read(content_length).decode("utf-8") if content_length else "{}"
         try:
@@ -3037,6 +4692,276 @@ class TradingAgentsWorkbenchHandler(SimpleHTTPRequestHandler):
             self._send_json(200, {"ok": True, **_admin_users_payload()})
             return
 
+        if parsed.path == "/api/forecast-observations":
+            user_id = _request_user_id(self, payload)
+            try:
+                result = _create_forecast_observation(user_id, payload)
+                paper_payload = None
+                if payload.get("execute_paper_account"):
+                    order_payload = {
+                        **payload,
+                        "source_run_id": result["episode"]["source_run_id"],
+                        "thesis": payload.get("thesis") or result["episode"].get("thesis"),
+                        "horizon_days": payload.get("horizon_days") or result["episode"].get("horizon_days"),
+                    }
+                    paper_payload = _submit_paper_order(user_id, order_payload)
+                    paper_episode = paper_payload.get("episode") or {}
+                    track = result.get("track") or {}
+                    links = track.get("simulation_links") if isinstance(track.get("simulation_links"), dict) else {}
+                    paper_ids = list(links.get("paper_episode_ids") or [])
+                    if paper_episode.get("episode_id"):
+                        paper_ids.append(paper_episode["episode_id"])
+                    updated = _conclusion_store(user_id).update_track(
+                        str(track.get("conclusion_id") or ""),
+                        {"simulation_links": {**links, "paper_episode_ids": paper_ids}},
+                        event_type="paper_account_linked",
+                        note="推演模拟盘已同步为纸面账户执行。",
+                    )
+                    result["track"] = updated.public_payload()
+                self._send_json(200, {"paper": paper_payload, **result, **_conclusions_payload(user_id)})
+            except KeyError:
+                self._send_json(404, {"error": "forecast_track_not_found"})
+            except Exception as error:
+                self._send_json(400, {"error": "forecast_observation_failed", "message": str(error)})
+            return
+
+        if parsed.path == "/api/paper/reset":
+            user_id = _request_user_id(self, payload)
+            initial_cash = _parse_initial_capital_input(str(payload.get("initial_cash") or "100000"))
+            account = _default_paper_account(initial_cash)
+            _save_paper_account(user_id, account)
+            self._send_json(200, {"ok": True, "account": _account_payload(account)})
+            return
+
+        if parsed.path == "/api/paper/order":
+            user_id = _request_user_id(self, payload)
+            ticker = str(payload.get("ticker") or "").strip().upper()
+            asset_type = str(payload.get("asset_type") or "stock").strip().lower() or "stock"
+            if not ticker:
+                self._send_json(400, {"error": "missing_ticker"})
+                return
+            try:
+                quote = _live_market_quote(ticker, asset_type)
+                market_ticker = str(quote["market_ticker"])
+                account = _load_paper_account(user_id)
+                _remember_paper_market_history(account, quote)
+                commission_rate = _parse_rate_input(str(payload.get("commission_rate") or "0"))
+                slippage_rate = _parse_rate_input(str(payload.get("slippage_rate") or "0"))
+                broker = _broker_from_account(account, commission_rate=commission_rate, slippage_rate=slippage_rate)
+                order = PaperOrder(
+                    ticker=market_ticker,
+                    trade_date=str(quote.get("as_of") or _today_iso()),
+                    asset_type=asset_type,
+                    rating=str(payload.get("rating") or payload.get("action") or "Manual"),
+                    action=str(payload.get("action") or "buy").strip().lower(),
+                    target_position_size=float(payload.get("target_position_size") or 0.0),
+                    risk_gate_approved=bool(payload.get("risk_gate_approved", True)),
+                    source_run_id=str(payload.get("source_run_id") or ""),
+                    thesis=str(payload.get("thesis") or ""),
+                    horizon_days=_safe_int(payload.get("horizon_days"), 20),
+                )
+                fill = broker.submit_order(order, float(quote["price"]))
+                snapshot = broker.snapshot(_now_iso(), {market_ticker: float(quote["price"])})
+                account["cash"] = broker.cash
+                account["positions"] = {
+                    symbol: position.model_dump()
+                    for symbol, position in broker.positions.items()
+                }
+                if fill is not None:
+                    fills = account.setdefault("fills", [])
+                    fills.append(fill.model_dump())
+                    account["fills"] = fills[-500:]
+                snapshots = account.setdefault("snapshots", [])
+                snapshots.append(snapshot.model_dump())
+                account["snapshots"] = snapshots[-240:]
+                _save_paper_account(user_id, account)
+                paper_result = PaperTradingResult(
+                    ticker=market_ticker,
+                    trade_date=order.trade_date,
+                    holding_days=order.horizon_days,
+                    resolved=True,
+                    order=order,
+                    fills=[fill] if fill is not None else [],
+                    snapshots=[snapshot],
+                )
+                episode = _record_paper_result_episode(
+                    user_id,
+                    paper_result,
+                    "live",
+                    source_run_id=order.source_run_id,
+                    thesis=order.thesis,
+                    confidence=_safe_float(payload.get("confidence")) or 0.0,
+                    initial_capital=float(account.get("initial_cash") or 0.0),
+                    market_as_of=str(quote.get("as_of") or ""),
+                    tags={
+                        "entrypoint": "api_paper_order",
+                        "commission_rate": commission_rate,
+                        "slippage_rate": slippage_rate,
+                    },
+                )
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "quote": quote,
+                        "order": order.model_dump(),
+                        "fill": fill.model_dump() if fill else None,
+                        "episode": episode.model_dump(),
+                        "account": _account_payload(account),
+                    },
+                )
+            except Exception as error:
+                self._send_json(400, {"error": "paper_order_failed", "message": str(error)})
+            return
+
+        if parsed.path == "/api/paper/replay-signal":
+            user_id = _request_user_id(self, payload)
+            run_id = str(payload.get("run_id") or "").strip()
+            if not run_id:
+                self._send_json(400, {"error": "missing_run_id"})
+                return
+            snapshot = _run_snapshot_for_user(user_id, run_id)
+            if snapshot is None:
+                self._send_json(404, {"error": "run_not_found"})
+                return
+            try:
+                run_payload = snapshot.get("payload") if isinstance(snapshot.get("payload"), dict) else {}
+                ticker = str(payload.get("ticker") or run_payload.get("ticker") or snapshot.get("ticker") or "").strip().upper()
+                asset_type = str(payload.get("asset_type") or run_payload.get("asset_type") or "stock").strip().lower() or "stock"
+                trade_date = str(payload.get("trade_date") or run_payload.get("analysis_date") or "").strip()
+                if not ticker or not trade_date:
+                    self._send_json(400, {"error": "missing_replay_inputs"})
+                    return
+                market_ticker = _normalize_market_data_ticker(ticker, asset_type)
+                holding_days = _safe_int(payload.get("horizon_days") or payload.get("holding_days"), 20)
+                initial_cash = _parse_initial_capital_input(str(payload.get("initial_cash") or "100000"))
+                commission_rate = _parse_rate_input(str(payload.get("commission_rate") or "0"))
+                slippage_rate = _parse_rate_input(str(payload.get("slippage_rate") or "0"))
+                graph = TradingAgentsGraph.__new__(TradingAgentsGraph)
+                graph.config = _build_run_config({**run_payload, "user_id": user_id})
+                result = graph.run_paper_trade_from_final_state(
+                    market_ticker,
+                    trade_date,
+                    _final_state_for_paper_replay(snapshot, payload),
+                    holding_days=holding_days,
+                    initial_capital=initial_cash,
+                    commission_rate=commission_rate,
+                    slippage_rate=slippage_rate,
+                    asset_type=asset_type,
+                )
+                account = _paper_replay_account_payload(result, initial_cash)
+                snapshot_result = snapshot.get("result") if isinstance(snapshot.get("result"), dict) else {}
+                episode = _record_paper_result_episode(
+                    user_id,
+                    result,
+                    "historical_replay",
+                    source_run_id=run_id,
+                    thesis=str(payload.get("thesis") or _thesis_from_run_snapshot(snapshot)),
+                    confidence=_safe_float(snapshot_result.get("confidence")) or 0.0,
+                    initial_capital=initial_cash,
+                    tags={
+                        "entrypoint": "api_paper_replay_signal",
+                        "commission_rate": commission_rate,
+                        "slippage_rate": slippage_rate,
+                    },
+                )
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "mode": "historical_replay",
+                        "result": _paper_trading_result_payload(holding_days, result),
+                        "episode": episode.model_dump(),
+                        "account": _account_payload(account),
+                        "analytics": _paper_analytics_payload(account, ticker=market_ticker),
+                    },
+                )
+            except Exception as error:
+                self._send_json(400, {"error": "paper_replay_failed", "message": str(error)})
+            return
+
+        if parsed.path == "/api/paper/replay-manual":
+            user_id = _request_user_id(self, payload)
+            try:
+                self._send_json(200, _run_manual_paper_replay(user_id, payload))
+            except Exception as error:
+                self._send_json(400, {"error": "paper_manual_replay_failed", "message": str(error)})
+            return
+
+        if api_path == "/api/conclusions":
+            user_id = _request_user_id(self, payload)
+            try:
+                track = _conclusion_store(user_id).add_track(payload)
+                self._send_json(200, {"ok": True, "track": track.public_payload(), **_conclusions_payload(user_id)})
+            except Exception as error:
+                self._send_json(400, {"error": "conclusion_create_failed", "message": str(error)})
+            return
+
+        if api_path == "/api/conclusions/from-run":
+            user_id = _request_user_id(self, payload)
+            run_id = str(payload.get("run_id") or "").strip()
+            if not run_id:
+                self._send_json(400, {"error": "missing_run_id"})
+                return
+            snapshot = _run_snapshot_for_user(user_id, run_id)
+            if snapshot is None:
+                self._send_json(404, {"error": "run_not_found"})
+                return
+            try:
+                track_payload = _conclusion_track_from_run_snapshot(snapshot, payload)
+                track = _conclusion_store(user_id).add_track(track_payload)
+                self._send_json(200, {"ok": True, "track": track.public_payload(), **_conclusions_payload(user_id)})
+            except Exception as error:
+                self._send_json(400, {"error": "conclusion_from_run_failed", "message": str(error)})
+            return
+
+        if api_path == "/api/conclusions/update":
+            user_id = _request_user_id(self, payload)
+            conclusion_id = str(payload.get("conclusion_id") or "").strip()
+            if not conclusion_id:
+                self._send_json(400, {"error": "missing_conclusion_id"})
+                return
+            allowed = {
+                "status",
+                "review_notes",
+                "current_price",
+                "raw_return",
+                "benchmark_return",
+                "alpha_return",
+            }
+            updates = {key: payload[key] for key in allowed if key in payload}
+            if not updates:
+                self._send_json(400, {"error": "empty_update"})
+                return
+            try:
+                track = _conclusion_store(user_id).update_track(
+                    conclusion_id,
+                    updates,
+                    event_type=str(payload.get("event_type") or "review"),
+                    note=str(payload.get("note") or payload.get("review_notes") or ""),
+                )
+                self._send_json(200, {"ok": True, "track": track.public_payload(), **_conclusions_payload(user_id)})
+            except KeyError:
+                self._send_json(404, {"error": "conclusion_not_found"})
+            except Exception as error:
+                self._send_json(400, {"error": "conclusion_update_failed", "message": str(error)})
+            return
+
+        if api_path == "/api/conclusions/delete":
+            user_id = _request_user_id(self, payload)
+            conclusion_id = str(payload.get("conclusion_id") or "").strip()
+            if not conclusion_id:
+                self._send_json(400, {"error": "missing_conclusion_id"})
+                return
+            try:
+                deleted = _conclusion_store(user_id).delete_track(conclusion_id)
+                self._send_json(200, {"ok": True, "deleted": deleted.public_payload(), **_conclusions_payload(user_id)})
+            except KeyError:
+                self._send_json(404, {"error": "conclusion_not_found"})
+            except Exception as error:
+                self._send_json(400, {"error": "conclusion_delete_failed", "message": str(error)})
+            return
+
         if parsed.path == "/api/discover-models":
             try:
                 payload["user_id"] = _request_user_id(self, payload)
@@ -3084,7 +5009,7 @@ class TradingAgentsWorkbenchHandler(SimpleHTTPRequestHandler):
                 )
             elif run.get("status") in {"completed", "failed", "cancelled"}:
                 _append_log(run, f"[cancel] 任务已处于 {run.get('status')}，无需取消")
-            run["updated_at"] = datetime.datetime.now().isoformat()
+            run["updated_at"] = _now_iso()
             run["metrics"] = _build_metrics_snapshot(run)
             self._send_json(200, {"ok": True, "run": _public_run_payload(run)})
             return
@@ -3182,6 +5107,12 @@ class TradingAgentsWorkbenchHandler(SimpleHTTPRequestHandler):
             "backtest_enabled": bool(payload.get("run_backtest")),
             "backtest_summary": "",
             "backtest_detail": [],
+            "backtest_episode_ids": [],
+            "paper_trading_enabled": bool(payload.get("run_paper_trading")),
+            "paper_trading_summary": "",
+            "paper_trading_detail": [],
+            "paper_trading_config": {},
+            "paper_episode_ids": [],
             "alpha_mining_enabled": bool(payload.get("run_alpha_mining")),
             "alpha_mining_summary": "",
             "alpha_mining_detail": None,
@@ -3242,8 +5173,8 @@ class TradingAgentsWorkbenchHandler(SimpleHTTPRequestHandler):
             "cancel_requested": False,
             "slot_acquired": False,
             "events": [],
-            "created_at": datetime.datetime.now().isoformat(),
-            "updated_at": datetime.datetime.now().isoformat(),
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
         }
         _append_event(run, "created", "任务已创建", {"ticker": ticker, "analysis_date": analysis_date})
         RUNS[run_id] = run

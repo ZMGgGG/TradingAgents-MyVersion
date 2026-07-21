@@ -2,8 +2,8 @@
 
 ## Issues to Fix
 
-### 1. `validate_model()` is never called
-- Add validation call in `get_llm()` with warning (not error) for unknown models
+### 1. ~~`validate_model()` is never called~~ (Fixed)
+- All provider clients now call `warn_if_unknown_model()` in `get_llm()` with a warning, not an error, for unknown models.
 
 ### 2. ~~Inconsistent parameter handling~~ (Fixed)
 - GoogleClient now accepts unified `api_key` and maps it to `google_api_key`

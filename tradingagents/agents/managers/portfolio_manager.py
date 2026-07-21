@@ -28,6 +28,7 @@ from tradingagents.agents.utils.agent_utils import (
 )
 from tradingagents.agents.utils.structured import (
     bind_structured,
+    has_structured_summary_block,
     invoke_structured_or_freetext_result,
 )
 
@@ -130,15 +131,23 @@ Keep the main decision memo readable for humans. The summary block should be bri
             "Portfolio Manager",
             fallback=parse_pm_decision,
         )
-        final_trade_decision = (
+        rendered_structured_decision = (
             render_pm_decision(structured_decision)
             if structured_decision is not None
-            else rendered_decision
+            else ""
         )
+        should_render_structured_decision = (
+            structured_decision is not None
+            and (
+                rendered_decision == rendered_structured_decision
+                or has_structured_summary_block(rendered_decision)
+            )
+        )
+        final_trade_decision = rendered_structured_decision if should_render_structured_decision else rendered_decision
         _sanitize_price_target(structured_decision, state)
         if structured_decision is not None and structured_decision.rating.value.lower() == "hold":
             structured_decision.target_position_size = 0.0
-        if structured_decision is not None:
+        if should_render_structured_decision:
             final_trade_decision = render_pm_decision(structured_decision)
 
         if risk_gate_result and not risk_gate_result.get("approved", True):

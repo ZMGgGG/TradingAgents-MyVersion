@@ -25,10 +25,29 @@ def set_config(config: Dict):
     initialize_config()
     incoming = deepcopy(config)
     for key, value in incoming.items():
-        if isinstance(value, dict) and isinstance(_config.get(key), dict):
+        if key == "tool_vendors" and value == {}:
+            _config[key] = {}
+        elif isinstance(value, dict) and isinstance(_config.get(key), dict):
             _config[key].update(value)
         else:
             _config[key] = value
+    if "_current_ticker" in incoming:
+        _apply_current_ticker_vendor_overrides(str(incoming.get("_current_ticker") or ""))
+
+
+def _apply_current_ticker_vendor_overrides(ticker: str) -> None:
+    """Keep legacy ticker-specific market vendor overrides in config."""
+    if _config is None:
+        return
+    tool_vendors = _config.setdefault("tool_vendors", {})
+    auto_chain = "akshare_cn,yfinance"
+    if ticker.upper().endswith((".SS", ".SZ")):
+        tool_vendors["get_stock_data"] = auto_chain
+        tool_vendors["get_indicators"] = auto_chain
+        return
+    for method in ("get_stock_data", "get_indicators"):
+        if tool_vendors.get(method) == auto_chain:
+            tool_vendors.pop(method, None)
 
 
 def get_config() -> Dict:

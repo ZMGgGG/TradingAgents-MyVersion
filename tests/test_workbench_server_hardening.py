@@ -16,6 +16,16 @@ def test_build_run_config_deep_copies_defaults():
 
 
 @pytest.mark.unit
+def test_semantic_simulation_api_paths_alias_legacy_handlers():
+    assert server._canonical_api_path("/api/simulation/forecast/order") == "/api/paper/order"
+    assert server._canonical_api_path("/api/simulation/backtest/manual") == "/api/paper/replay-manual"
+    assert server._canonical_api_path("/api/simulation/observation/intraday") == "/api/paper/intraday"
+    assert server._canonical_api_path("/api/simulation/episodes") == "/api/paper/episodes"
+    assert server._canonical_api_path("/api/observations/from-run") == "/api/conclusions/from-run"
+    assert server._canonical_api_path("/api/paper/order") == "/api/paper/order"
+
+
+@pytest.mark.unit
 def test_build_run_config_keeps_task_api_key_out_of_environment(monkeypatch):
     monkeypatch.delenv("DASHSCOPE_CN_API_KEY", raising=False)
 
