@@ -2179,6 +2179,15 @@ def _intraday_market_quote(ticker: str, asset_type: str = "stock") -> dict[str, 
     quote = _latest_market_quote(ticker, asset_type)
     market_ticker = str(quote.get("market_ticker") or _normalize_market_data_ticker(ticker, asset_type))
     today = _now_local().date()
+    quote_date_text = str(quote.get("as_of") or "")[:10]
+    try:
+        quote_date = datetime.date.fromisoformat(quote_date_text)
+    except ValueError:
+        quote_date = None
+    # Do not combine a stale/historical daily quote with today's minute data.
+    # A short tolerance still permits Friday -> Monday and holiday gaps.
+    if quote_date is not None and (today - quote_date).days > 7:
+        return quote
     rows: list[dict[str, Any]] = []
     try:
         import yfinance as yf
@@ -2310,6 +2319,7 @@ def _mark_paper_account(user_id: str, ticker: str = "", asset_type: str = "stock
     account = _load_paper_account(user_id)
     prices: dict[str, float] = {}
     quote = None
+    quote_times: list[str] = []
     symbols = set(account.get("positions", {}).keys())
     if ticker:
         symbols.add(_normalize_market_data_ticker(ticker, asset_type))
@@ -2317,12 +2327,14 @@ def _mark_paper_account(user_id: str, ticker: str = "", asset_type: str = "stock
         try:
             quote = _live_market_quote(symbol, asset_type)
             prices[str(quote["market_ticker"])] = float(quote["price"])
+            if quote.get("as_of"):
+                quote_times.append(str(quote["as_of"]))
             _remember_paper_market_history(account, quote)
         except Exception:
             continue
     broker = _broker_from_account(account)
     if prices:
-        snapshot = broker.snapshot(_now_iso(), prices)
+        snapshot = broker.snapshot(max(quote_times) if quote_times else _now_iso(), prices)
         account["cash"] = broker.cash
         account["positions"] = {
             ticker: position.model_dump()
